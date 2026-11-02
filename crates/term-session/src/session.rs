@@ -2,7 +2,6 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -12,22 +11,28 @@ use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::selection::Selection;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::{viewport_to_point, Config, Term, TermDamage};
+use alacritty_terminal::term::{Config, Term, TermDamage};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, Processor};
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
-use crate::blocks::{Block, Blocks};
+use std::ops::Range;
+
+use crate::blocks::{self, Block, Blocks, Row};
 use crate::cwd::pid_cwd;
 use crate::links;
 use crate::osc133::{Mark, Scanner};
-use crate::search::{self, FindQuery, FindResults};
+use crate::search::{self, BufferPoint, FindQuery, FindResults};
+use crate::shell::{self, ScriptDir};
 
 pub use alacritty_terminal::index::Side;
 pub use alacritty_terminal::selection::SelectionType as SelectionKind;
 pub use alacritty_terminal::term::TermMode;
 
-const INTEGRATION: &str = include_str!("../shell/integration.zsh");
+/// Lines kept above the screen. Once this many exist, the oldest line goes for
+/// each new one, so the lines that block positions refer to move. See
+/// [`buffer_point`].
+const SCROLLBACK_LINES: usize = 10_000;
 
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 type Listener = Arc<dyn Fn(SessionEvent) + Send + Sync>;
@@ -56,15 +61,104 @@ pub struct Session {
     /// The shell's process id, used to ask the OS for its directory.
     pid: Option<u32>,
     state: Arc<Mutex<State>>,
-    /// The temporary ZDOTDIR written for zsh. Removed on drop.
-    zdotdir: Option<PathBuf>,
+    /// The scripts that start the shell with integration. Only kept so they are
+    /// removed on drop.
+    _scripts: Option<ScriptDir>,
 }
 
 struct State {
     term: Term<PtyResponder>,
     blocks: Blocks,
-    /// The last directory the shell reported with OSC 7.
-    cwd: Option<PathBuf>,
+    scrollback: Scrollback,
+}
+
+/// Counts the lines that leave the top of a full scrollback, so block positions
+/// can follow the lines they point at.
+///
+/// Alacritty drops those lines without a count. While counting, the view offset
+/// of the primary screen is 1 plus the lines scrolled into history, because
+/// alacritty adds to a non-zero offset on each scroll. The offset is read at
+/// every escape sequence and mark, which is when the lines are needed.
+#[derive(Default)]
+struct Scrollback {
+    /// The offset the user had before counting. `Some` while counting.
+    user_offset: Option<usize>,
+    /// The history size when the current count began.
+    start_history: usize,
+    /// Lines dropped before the current count began.
+    base: usize,
+    /// Lines dropped so far, as far as the block positions know.
+    applied: usize,
+}
+
+impl Scrollback {
+    /// Starts counting on the primary screen, if it has history and is not counting.
+    fn start(&mut self, term: &mut Term<PtyResponder>) {
+        if self.user_offset.is_some() || term.mode().contains(TermMode::ALT_SCREEN) {
+            return;
+        }
+        let history = term.grid().history_size();
+        if history == 0 {
+            return;
+        }
+        self.user_offset = Some(term.grid().display_offset());
+        self.start_history = history;
+        self.base = self.applied;
+        set_offset(term, 1);
+    }
+
+    /// Moves the block positions by the lines dropped so far. Does nothing on
+    /// the alternate screen, which is not counted.
+    fn count(&mut self, term: &mut Term<PtyResponder>, blocks: &mut Blocks) {
+        if self.user_offset.is_none() || term.mode().contains(TermMode::ALT_SCREEN) {
+            return;
+        }
+        let offset = term.grid().display_offset();
+        if offset + 1 >= SCROLLBACK_LINES {
+            // The count hit alacritty's limit, so lines were lost. The positions
+            // cannot be trusted, and counting starts again from here.
+            blocks.forget_positions();
+            set_offset(term, 1);
+            self.base = self.applied;
+            self.start_history = term.grid().history_size();
+            return;
+        }
+        let pushed = offset.saturating_sub(1);
+        // Until the scrollback is full, lines scrolled up only add to the history.
+        let room = SCROLLBACK_LINES.saturating_sub(self.start_history);
+        let dropped = self.base + pushed.saturating_sub(room);
+        if dropped > self.applied {
+            blocks.shift_up(dropped - self.applied);
+            self.applied = dropped;
+        }
+    }
+
+    /// Ends counting and gives the user's view offset back. Does nothing on the
+    /// alternate screen: the count waits until the primary screen is active.
+    fn stop(&mut self, term: &mut Term<PtyResponder>) {
+        let (Some(user), false) = (
+            self.user_offset,
+            term.mode().contains(TermMode::ALT_SCREEN),
+        ) else {
+            return;
+        };
+        let pushed = term.grid().display_offset().saturating_sub(1);
+        // Alacritty keeps a view that is scrolled up in place as lines arrive.
+        // A view at the bottom stays there.
+        let target = if user == 0 {
+            0
+        } else {
+            (user + pushed).min(term.grid().history_size())
+        };
+        set_offset(term, target);
+        self.user_offset = None;
+    }
+}
+
+/// Moves the primary screen's view offset to `offset`.
+fn set_offset(term: &mut Term<PtyResponder>, offset: usize) {
+    let delta = offset as i32 - term.grid().display_offset() as i32;
+    term.scroll_display(Scroll::Delta(delta));
 }
 
 /// Sends terminal replies (for example to cursor-position queries) back to the
@@ -105,6 +199,28 @@ pub struct Snapshot {
     /// The buffer line (see [`BufferPoint`](crate::BufferPoint)) shown on the
     /// first viewport line.
     pub top_line: usize,
+}
+
+/// What a pane draws in one frame: visual rows from the top, each with its
+/// cells. A plain frame has one row per viewport line. With blocks, a header
+/// row replaces a finished command's prompt and command lines.
+pub struct Frame {
+    /// One entry per visual row, top first.
+    pub rows: Vec<Row>,
+    pub columns: usize,
+    /// `rows.len() * columns` cells, row-major. The `line` of each cell is its
+    /// visual row. Cells of a header row are blank.
+    pub cells: Vec<SnapshotCell>,
+    /// `line` is the visual row of the cursor. `visible` is false when the
+    /// cursor's line is not drawn.
+    pub cursor: Cursor,
+    /// The blocks whose header is in `rows`.
+    pub headers: Vec<Block>,
+    /// The block whose output fills the top row, so its header is stuck there.
+    pub sticky: Option<Block>,
+    /// The visual rows of the selected block (its header and output), if it is
+    /// on screen and finished.
+    pub selected: Option<Range<usize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -166,8 +282,8 @@ impl Snapshot {
 }
 
 impl Session {
-    /// Starts the user's login shell in a new PTY. zsh gets the OSC 133
-    /// integration; other shells start as plain login shells.
+    /// Starts the user's login shell in a new PTY. zsh, bash and fish get the
+    /// OSC 133 integration; other shells start as plain login shells.
     pub fn spawn(cols: u16, rows: u16) -> Result<Self> {
         Self::spawn_in(cols, rows, None, |_| {})
     }
@@ -189,14 +305,23 @@ impl Session {
         cwd: Option<&Path>,
         listener: impl Fn(SessionEvent) + Send + Sync + 'static,
     ) -> Result<Self> {
+        Self::spawn_shell(&login_shell(), cols, rows, cwd, listener)
+    }
+
+    /// Like [`Session::spawn_in`], for the shell at path `shell`.
+    pub(crate) fn spawn_shell(
+        shell: &str,
+        cols: u16,
+        rows: u16,
+        cwd: Option<&Path>,
+        listener: impl Fn(SessionEvent) + Send + Sync + 'static,
+    ) -> Result<Self> {
         let listener: Listener = Arc::new(listener);
         let pair = native_pty_system()
             .openpty(pty_size(cols, rows))
             .context("openpty")?;
 
-        let shell = login_shell();
-        let mut command = CommandBuilder::new(&shell);
-        command.arg("-l");
+        let mut command = CommandBuilder::new(shell);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
         match cwd {
@@ -207,15 +332,7 @@ impl Session {
                 }
             }
         }
-
-        let zdotdir = if is_zsh(&shell) {
-            let dir = write_zdotdir()?;
-            command.env("TERM_SESSION_USER_ZDOTDIR", user_zdotdir());
-            command.env("ZDOTDIR", &dir);
-            Some(dir)
-        } else {
-            None
-        };
+        let scripts = shell::configure(shell, &mut command)?;
 
         let child = pair
             .slave
@@ -229,7 +346,10 @@ impl Session {
             Arc::new(Mutex::new(pair.master.take_writer().context("pty writer")?));
 
         let term = Term::new(
-            Config::default(),
+            Config {
+                scrolling_history: SCROLLBACK_LINES,
+                ..Config::default()
+            },
             &TermSize::new(cols as usize, rows as usize),
             PtyResponder {
                 writer: writer.clone(),
@@ -239,7 +359,7 @@ impl Session {
         let state = Arc::new(Mutex::new(State {
             term,
             blocks: Blocks::default(),
-            cwd: None,
+            scrollback: Scrollback::default(),
         }));
         spawn_reader(reader, state.clone(), listener);
 
@@ -249,7 +369,7 @@ impl Session {
             child,
             pid,
             state,
-            zdotdir,
+            _scripts: scripts,
         })
     }
 
@@ -257,7 +377,13 @@ impl Session {
     /// shell. Without one (no integration), asks the OS for the directory of
     /// the shell process.
     pub fn cwd(&self) -> Option<PathBuf> {
-        let reported = self.state.lock().expect("state lock poisoned").cwd.clone();
+        let reported = self
+            .state
+            .lock()
+            .expect("state lock poisoned")
+            .blocks
+            .cwd()
+            .cloned();
         reported.or_else(|| pid_cwd(self.pid?))
     }
 
@@ -277,12 +403,20 @@ impl Session {
     }
 
     /// Resizes the PTY (which sends SIGWINCH to the shell) and the terminal grid.
+    /// A width change rewraps the buffer, so the blocks forget their positions.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         self.master.resize(pty_size(cols, rows))?;
-        let mut state = self.state.lock().expect("state lock poisoned");
-        state
-            .term
-            .resize(TermSize::new(cols as usize, rows as usize));
+        let mut guard = self.state.lock().expect("state lock poisoned");
+        let State {
+            term,
+            blocks,
+            scrollback,
+        } = &mut *guard;
+        if cols as usize != term.columns() {
+            scrollback.stop(term);
+            blocks.forget_positions();
+        }
+        term.resize(TermSize::new(cols as usize, rows as usize));
         Ok(())
     }
 
@@ -290,54 +424,90 @@ impl Session {
     /// should call this, because it resets the damage.
     pub fn snapshot(&self) -> Snapshot {
         let mut guard = self.state.lock().expect("state lock poisoned");
-        let term = &mut guard.term;
+        take_snapshot(&mut guard.term)
+    }
 
-        let damage = match term.damage() {
-            TermDamage::Full => Damage::Full,
-            TermDamage::Partial(lines) => Damage::Lines(
-                lines
-                    .map(|l| LineDamage {
-                        line: l.line,
-                        left: l.left,
-                        right: l.right,
-                    })
+    /// What to draw this frame. With command blocks on screen, the rows follow
+    /// the blocks (see [`Row`]). On the alternate screen, or with no blocks, the
+    /// frame is the plain grid, one row per viewport line. Resets damage, like
+    /// [`Session::snapshot`].
+    pub fn frame(&self, selected: Option<u64>) -> Frame {
+        let mut guard = self.state.lock().expect("state lock poisoned");
+        let State { term, blocks, .. } = &mut *guard;
+        let all = blocks.all();
+        if term.mode().contains(TermMode::ALT_SCREEN) || all.is_empty() {
+            let snapshot = take_snapshot(term);
+            return Frame {
+                rows: (0..snapshot.rows)
+                    .map(|line| Row::Line(snapshot.top_line + line))
                     .collect(),
-            ),
-        };
-        term.reset_damage();
+                columns: snapshot.columns,
+                cells: snapshot.cells,
+                cursor: snapshot.cursor,
+                headers: Vec::new(),
+                sticky: None,
+                selected: None,
+            };
+        }
 
+        let history = term.grid().history_size();
+        let screen = term.screen_lines();
+        let top = history - term.grid().display_offset();
+        let rows = blocks::frame_rows(all, top, history + screen, screen);
+        let columns = term.columns();
         let content = term.renderable_content();
-        // Grid lines are relative to the bottom of the screen. Adding the
-        // display offset maps them to viewport lines.
-        let offset = content.display_offset as i32;
         let selection = content.selection;
-        let cells = content
-            .display_iter
-            .map(|indexed| SnapshotCell {
-                line: (indexed.point.line.0 + offset) as usize,
-                column: indexed.point.column.0,
-                c: indexed.cell.c,
-                zerowidth: indexed.cell.zerowidth().map(Box::from),
-                fg: indexed.cell.fg,
-                bg: indexed.cell.bg,
-                flags: indexed.cell.flags,
-                selected: selection.is_some_and(|s| s.contains(indexed.point)),
-            })
-            .collect();
+
+        let mut cells = Vec::with_capacity(rows.len() * columns);
+        let mut headers = Vec::new();
+        for (line, row) in rows.iter().enumerate() {
+            match *row {
+                Row::Line(buffer_line) => {
+                    let grid_line = Line(buffer_line as i32 - history as i32);
+                    for column in 0..columns {
+                        let cell = &term.grid()[grid_line][Column(column)];
+                        cells.push(SnapshotCell {
+                            line,
+                            column,
+                            c: cell.c,
+                            zerowidth: cell.zerowidth().map(Box::from),
+                            fg: cell.fg,
+                            bg: cell.bg,
+                            flags: cell.flags,
+                            selected: selection
+                                .is_some_and(|s| s.contains(Point::new(grid_line, Column(column)))),
+                        });
+                    }
+                }
+                Row::Header(id) => {
+                    headers.extend(all.iter().find(|block| block.id == id).cloned());
+                    cells.extend((0..columns).map(|column| blank_cell(line, column)));
+                }
+            }
+        }
+
+        let cursor_line = history + content.cursor.point.line.0 as usize;
+        let cursor_row = rows.iter().position(|row| *row == Row::Line(cursor_line));
         let cursor = Cursor {
-            line: (content.cursor.point.line.0 + offset) as usize,
+            line: cursor_row.unwrap_or(0),
             column: content.cursor.point.column.0,
-            visible: content.cursor.shape != CursorShape::Hidden,
+            visible: cursor_row.is_some() && content.cursor.shape != CursorShape::Hidden,
             shape: content.cursor.shape,
         };
+        let sticky = match rows.first() {
+            Some(Row::Line(line)) => blocks::block_containing_output(all, *line).cloned(),
+            _ => None,
+        };
 
-        Snapshot {
-            columns: term.columns(),
-            rows: term.screen_lines(),
+        let selected = selected.and_then(|id| selected_rows(all, &rows, id));
+        Frame {
+            rows,
+            columns,
             cells,
             cursor,
-            damage,
-            top_line: term.grid().history_size() - term.grid().display_offset(),
+            headers,
+            sticky,
+            selected,
         }
     }
 
@@ -378,6 +548,17 @@ impl Session {
         term.scroll_display(Scroll::Delta(wanted as i32 - offset as i32));
     }
 
+    /// Scrolls so buffer line `line` is the top line of the view, as far as the
+    /// scrollback allows.
+    pub fn scroll_top_to(&self, line: usize) {
+        let mut state = self.state.lock().expect("state lock poisoned");
+        let term = &mut state.term;
+        let history = term.grid().history_size();
+        let wanted = history.saturating_sub(line) as i32;
+        let offset = term.grid().display_offset() as i32;
+        term.scroll_display(Scroll::Delta(wanted - offset));
+    }
+
     /// A handle that runs find queries on this session's buffer. It can be sent
     /// to a background thread.
     pub fn finder(&self) -> Finder {
@@ -386,18 +567,17 @@ impl Session {
         }
     }
 
-    /// Starts a selection at a viewport cell. `line` and `column` are viewport
-    /// coordinates, as in [`Snapshot`].
+    /// Starts a selection at a buffer cell (see [`BufferPoint`](crate::BufferPoint)).
     pub fn start_selection(&self, kind: SelectionKind, line: usize, column: usize, side: Side) {
         let mut state = self.state.lock().expect("state lock poisoned");
-        let point = viewport_point(&state.term, line, column);
+        let point = grid_point(&state.term, line, column);
         state.term.selection = Some(Selection::new(kind, point, side));
     }
 
-    /// Extends the selection to a viewport cell. Does nothing without a selection.
+    /// Extends the selection to a buffer cell. Does nothing without a selection.
     pub fn update_selection(&self, line: usize, column: usize, side: Side) {
         let mut state = self.state.lock().expect("state lock poisoned");
-        let point = viewport_point(&state.term, line, column);
+        let point = grid_point(&state.term, line, column);
         if let Some(selection) = state.term.selection.as_mut() {
             selection.update(point, side);
         }
@@ -416,12 +596,11 @@ impl Session {
             .selection_to_string()
     }
 
-    /// The URL under a viewport cell, if there is one. Reads the grid directly,
-    /// so it does not take a full snapshot.
+    /// The URL under a buffer cell, if there is one.
     pub fn url_at(&self, line: usize, column: usize) -> Option<links::Link> {
         let state = self.state.lock().expect("state lock poisoned");
         let term = &state.term;
-        let grid_line = Line(line as i32 - term.grid().display_offset() as i32);
+        let grid_line = grid_line(term, line);
         let row: Vec<_> = (0..term.columns())
             .map(|c| {
                 let cell = &term.grid()[grid_line][Column(c)];
@@ -429,6 +608,36 @@ impl Session {
             })
             .collect();
         links::link_at(&row, column)
+    }
+
+    /// The buffer line at the top of the view. Its frame may start above it,
+    /// when headers and hidden output make the rows fill upward.
+    pub fn top_line(&self) -> usize {
+        let state = self.state.lock().expect("state lock poisoned");
+        state.term.grid().history_size() - state.term.grid().display_offset()
+    }
+
+    /// The last block whose prompt is above buffer line `line`.
+    pub fn previous_block(&self, line: usize) -> Option<Block> {
+        let state = self.state.lock().expect("state lock poisoned");
+        state
+            .blocks
+            .all()
+            .iter()
+            .rev()
+            .find(|b| b.prompt_line.is_some_and(|p| p < line))
+            .cloned()
+    }
+
+    /// The first block whose prompt is below buffer line `line`.
+    pub fn next_block(&self, line: usize) -> Option<Block> {
+        let state = self.state.lock().expect("state lock poisoned");
+        state
+            .blocks
+            .all()
+            .iter()
+            .find(|b| b.prompt_line.is_some_and(|p| p > line))
+            .cloned()
     }
 
     /// Command blocks so far, oldest first. Closed blocks have an exit code.
@@ -439,6 +648,60 @@ impl Session {
             .blocks
             .all()
             .to_vec()
+    }
+
+    /// Shows or hides the output of block `id`. Returns `false` for an unknown id.
+    pub fn toggle_block(&self, id: u64) -> bool {
+        let mut state = self.state.lock().expect("state lock poisoned");
+        state.blocks.toggle_collapsed(id)
+    }
+
+    /// The command line of block `id`, as the shell reported it.
+    pub fn block_command(&self, id: u64) -> Option<String> {
+        let state = self.state.lock().expect("state lock poisoned");
+        state
+            .blocks
+            .all()
+            .iter()
+            .find(|b| b.id == id)?
+            .command
+            .clone()
+    }
+
+    /// The text of block `id`'s output: its lines without trailing spaces, with
+    /// wrapped rows joined. `None` for an unknown block or one without output
+    /// lines (still running, or on the alternate screen).
+    pub fn block_output(&self, id: u64) -> Option<String> {
+        let state = self.state.lock().expect("state lock poisoned");
+        let block = state.blocks.all().iter().find(|b| b.id == id)?;
+        let term = &state.term;
+        let start = block.output_line?;
+        let end = block
+            .end_line?
+            .min(term.grid().history_size() + term.screen_lines());
+        let mut text = String::new();
+        for line in start..end {
+            let grid_line = grid_line(term, line);
+            let row = &term.grid()[grid_line];
+            let mut row_text = String::new();
+            for column in 0..term.columns() {
+                let cell = &row[Column(column)];
+                if !cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    row_text.push(cell.c);
+                    if let Some(extra) = cell.zerowidth() {
+                        row_text.extend(extra.iter());
+                    }
+                }
+            }
+            text.push_str(row_text.trim_end());
+            if !row[Column(term.columns() - 1)]
+                .flags
+                .contains(Flags::WRAPLINE)
+            {
+                text.push('\n');
+            }
+        }
+        Some(text.trim_end_matches('\n').to_string())
     }
 }
 
@@ -460,17 +723,113 @@ impl Finder {
 impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.child.kill();
-        if let Some(dir) = &self.zdotdir {
-            let _ = std::fs::remove_dir_all(dir);
-        }
     }
 }
 
-fn viewport_point(term: &Term<PtyResponder>, line: usize, column: usize) -> Point {
-    viewport_to_point(
-        term.grid().display_offset(),
-        Point::new(line, Column(column)),
-    )
+/// The visible grid as a snapshot. See [`Session::snapshot`].
+fn take_snapshot(term: &mut Term<PtyResponder>) -> Snapshot {
+    let damage = match term.damage() {
+        TermDamage::Full => Damage::Full,
+        TermDamage::Partial(lines) => Damage::Lines(
+            lines
+                .map(|l| LineDamage {
+                    line: l.line,
+                    left: l.left,
+                    right: l.right,
+                })
+                .collect(),
+        ),
+    };
+    term.reset_damage();
+
+    let content = term.renderable_content();
+    // Grid lines are relative to the bottom of the screen. Adding the
+    // display offset maps them to viewport lines.
+    let offset = content.display_offset as i32;
+    let selection = content.selection;
+    let cells = content
+        .display_iter
+        .map(|indexed| SnapshotCell {
+            line: (indexed.point.line.0 + offset) as usize,
+            column: indexed.point.column.0,
+            c: indexed.cell.c,
+            zerowidth: indexed.cell.zerowidth().map(Box::from),
+            fg: indexed.cell.fg,
+            bg: indexed.cell.bg,
+            flags: indexed.cell.flags,
+            selected: selection.is_some_and(|s| s.contains(indexed.point)),
+        })
+        .collect();
+    let cursor = Cursor {
+        line: (content.cursor.point.line.0 + offset) as usize,
+        column: content.cursor.point.column.0,
+        visible: content.cursor.shape != CursorShape::Hidden,
+        shape: content.cursor.shape,
+    };
+
+    Snapshot {
+        columns: term.columns(),
+        rows: term.screen_lines(),
+        cells,
+        cursor,
+        damage,
+        top_line: term.grid().history_size() - term.grid().display_offset(),
+    }
+}
+
+/// The visual rows that belong to block `id`: its header row, and the rows
+/// of its output. `None` for a block that is unknown, still running, or not in
+/// `rows`.
+fn selected_rows(blocks: &[Block], rows: &[Row], id: u64) -> Option<Range<usize>> {
+    let block = blocks.iter().find(|b| b.id == id)?;
+    let (start, end) = (block.prompt_line?, block.end_line?);
+    let mut matching = rows.iter().enumerate().filter_map(|(index, row)| {
+        let inside = match row {
+            Row::Header(header) => *header == id,
+            Row::Line(line) => (start..end).contains(line),
+        };
+        inside.then_some(index)
+    });
+    let first = matching.next()?;
+    let last = matching.last().unwrap_or(first);
+    Some(first..last + 1)
+}
+
+/// A cell with no text, drawn as the background.
+fn blank_cell(line: usize, column: usize) -> SnapshotCell {
+    SnapshotCell {
+        line,
+        column,
+        c: ' ',
+        zerowidth: None,
+        fg: Color::Named(alacritty_terminal::vte::ansi::NamedColor::Foreground),
+        bg: Color::Named(alacritty_terminal::vte::ansi::NamedColor::Background),
+        flags: Flags::empty(),
+        selected: false,
+    }
+}
+
+/// The grid line of a buffer line. Grid lines are 0 at the top of the screen
+/// and negative in the history.
+fn grid_line(term: &Term<PtyResponder>, line: usize) -> Line {
+    Line(line as i32 - term.grid().history_size() as i32)
+}
+
+fn grid_point(term: &Term<PtyResponder>, line: usize, column: usize) -> Point {
+    Point::new(grid_line(term, line), Column(column))
+}
+
+/// The cursor's buffer point. `None` on the alternate screen, which has no
+/// buffer of its own to refer to.
+fn buffer_point(term: &Term<PtyResponder>) -> Option<BufferPoint> {
+    if term.mode().contains(TermMode::ALT_SCREEN) {
+        return None;
+    }
+    let cursor = term.grid().cursor.point;
+    Some(BufferPoint {
+        line: term.grid().history_size() + cursor.line.0 as usize,
+        column: cursor.column.0,
+    })
 }
 
 fn spawn_reader(mut reader: Box<dyn Read + Send>, state: Arc<Mutex<State>>, listener: Listener) {
@@ -484,15 +843,9 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, state: Arc<Mutex<State>>, list
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        let bytes = &buf[..n];
                         {
                             let mut guard = state.lock().expect("state lock poisoned");
-                            let State { term, blocks, cwd } = &mut *guard;
-                            scanner.feed(bytes, |mark| match mark {
-                                Mark::Cwd(path) => *cwd = Some(PathBuf::from(path)),
-                                mark => blocks.apply(mark),
-                            });
-                            parser.advance(term, bytes);
+                            process(&mut guard, &mut parser, &mut scanner, &buf[..n]);
                         }
                         listener(SessionEvent::Output);
                     }
@@ -504,6 +857,49 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, state: Arc<Mutex<State>>, list
             listener(SessionEvent::Exit);
         })
         .expect("spawn pty reader thread");
+}
+
+/// Parses one read of PTY output into the terminal and the block list.
+///
+/// Each mark is applied with the grid as it is at the mark, so the bytes before
+/// it are parsed first. The bytes are also split at each escape, so the count of
+/// dropped lines is taken before anything that could scroll the screen.
+fn process(state: &mut State, parser: &mut Processor, scanner: &mut Scanner, bytes: &[u8]) {
+    const ESC: u8 = 0x1b;
+
+    let mut marks = Vec::new();
+    scanner.scan(bytes, |mark: Mark, end| marks.push((mark, end)));
+
+    let State {
+        term,
+        blocks,
+        scrollback,
+    } = state;
+    scrollback.start(term);
+    let mut marks = marks.into_iter().peekable();
+    let mut parsed = 0;
+    for (index, &byte) in bytes.iter().enumerate() {
+        while let Some((mark, end)) = marks.next_if(|(_, end)| *end <= index) {
+            parser.advance(term, &bytes[parsed..end]);
+            parsed = end;
+            scrollback.count(term, blocks);
+            blocks.apply(mark, buffer_point(term));
+        }
+        if byte == ESC {
+            parser.advance(term, &bytes[parsed..index]);
+            parsed = index;
+            scrollback.count(term, blocks);
+        }
+    }
+    for (mark, end) in marks {
+        parser.advance(term, &bytes[parsed..end]);
+        parsed = end;
+        scrollback.count(term, blocks);
+        blocks.apply(mark, buffer_point(term));
+    }
+    parser.advance(term, &bytes[parsed..]);
+    scrollback.count(term, blocks);
+    scrollback.stop(term);
 }
 
 fn pty_size(cols: u16, rows: u16) -> PtySize {
@@ -521,44 +917,6 @@ fn login_shell() -> String {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "/bin/zsh".into())
-}
-
-fn is_zsh(shell: &str) -> bool {
-    Path::new(shell).file_name().is_some_and(|name| name == "zsh")
-}
-
-/// Where the user keeps their zsh files: `$ZDOTDIR`, or `$HOME`.
-fn user_zdotdir() -> PathBuf {
-    std::env::var_os("ZDOTDIR")
-        .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
-}
-
-/// Writes a ZDOTDIR for this process. zsh reads the four startup files from
-/// it. Each one sources the user's file of the same name first. `.zshrc`
-/// then loads the integration and gives `ZDOTDIR` back to the user's directory,
-/// so `.zlogin` and child shells see the normal setup.
-fn write_zdotdir() -> Result<PathBuf> {
-    // Unique per session: several sessions can exist in one process (tabs, splits).
-    static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("term-session-{}-{id}", std::process::id()));
-    std::fs::create_dir_all(&dir).context("create ZDOTDIR")?;
-
-    let source = |name: &str| {
-        format!("[[ -r \"$TERM_SESSION_USER_ZDOTDIR/{name}\" ]] && source \"$TERM_SESSION_USER_ZDOTDIR/{name}\"\n")
-    };
-    std::fs::write(dir.join(".zshenv"), source(".zshenv")).context("write .zshenv")?;
-    std::fs::write(dir.join(".zprofile"), source(".zprofile")).context("write .zprofile")?;
-
-    let rc = format!(
-        "{}{INTEGRATION}\nexport ZDOTDIR=\"$TERM_SESSION_USER_ZDOTDIR\"\nunset TERM_SESSION_USER_ZDOTDIR\n",
-        source(".zshrc")
-    );
-    std::fs::write(dir.join(".zshrc"), rc).context("write .zshrc")?;
-    Ok(dir)
 }
 
 #[cfg(test)]

@@ -92,7 +92,13 @@ pub struct Scanner {
 impl Scanner {
     /// Feeds raw PTY bytes and calls `on_mark` for each complete OSC 133 sequence.
     pub fn feed(&mut self, bytes: &[u8], mut on_mark: impl FnMut(Mark)) {
-        for &b in bytes {
+        self.scan(bytes, |mark, _| on_mark(mark));
+    }
+
+    /// Like [`Scanner::feed`]. `on_mark` also gets the index just after the
+    /// sequence that held the mark, so the caller can split the bytes there.
+    pub fn scan(&mut self, bytes: &[u8], mut on_mark: impl FnMut(Mark, usize)) {
+        for (index, &b) in bytes.iter().enumerate() {
             self.state = match (self.state, b) {
                 (State::Ground, ESC) | (State::Escape, ESC) => State::Escape,
                 (State::Ground, _) => State::Ground,
@@ -103,7 +109,7 @@ impl Scanner {
                 }
                 (State::Escape, _) => State::Ground,
                 (State::Osc, BEL) => {
-                    self.finish(&mut on_mark);
+                    self.finish(index + 1, &mut on_mark);
                     State::Ground
                 }
                 (State::Osc, ESC) => State::OscEscape,
@@ -112,7 +118,7 @@ impl Scanner {
                     State::Osc
                 }
                 (State::OscEscape, b'\\') => {
-                    self.finish(&mut on_mark);
+                    self.finish(index + 1, &mut on_mark);
                     State::Ground
                 }
                 (State::OscEscape, ESC) => State::Escape,
@@ -129,12 +135,12 @@ impl Scanner {
         }
     }
 
-    fn finish(&mut self, on_mark: &mut impl FnMut(Mark)) {
+    fn finish(&mut self, end: usize, on_mark: &mut impl FnMut(Mark, usize)) {
         if self.overflow {
             return;
         }
         if let Some(mark) = parse_payload(&self.payload) {
-            on_mark(mark);
+            on_mark(mark, end);
         }
     }
 }

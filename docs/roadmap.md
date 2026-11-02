@@ -13,7 +13,7 @@ when its exit criterion is met in real use, not when the code compiles.
 | M0 | Session core | Done (headless only) |
 | M1 | Single-window terminal | Done (2026-11-01) |
 | M2 | Workspace | **Daily driver** as a classic terminal (replaces iTerm2/Warp for plain use) |
-| M3 | Blocks | Daily driver with Warp-style output |
+| M3 | Blocks | Daily driver with Warp-style output (built, manual checks pending) |
 | M4 | Input editor | Daily driver with Warp-style input |
 | M5 | Completions | |
 | M6 | Sidebars, settings UI, themes | Feature-complete v1 |
@@ -63,6 +63,9 @@ Status: built, and the build and tests pass. Manual checks are pending; see
 **Exit:** you use it instead of Warp for a full week of normal work.
 
 ## M3 — Blocks
+
+Status: built, and the build and tests pass. Manual checks are pending; see
+[m3-checklist.md](m3-checklist.md). M3 is done after the week of use.
 
 - Shell integration for zsh, bash and fish, injected automatically (OSC 133 + metadata).
 - Block rendering: header with command, exit status, duration and cwd; sticky

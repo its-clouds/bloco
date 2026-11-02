@@ -4,7 +4,7 @@
 //! Key handling follows `zed-industries/zed`, crates/terminal_view/src/terminal_view.rs
 //! (GPL-3.0-or-later). See NOTICE.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -19,10 +19,12 @@ use gpui::{
     MouseUpEvent, Pixels, Point, Render, ScrollEvent, SharedString, Task, UTF16Selection, Window,
     div, prelude::*, px, relative,
 };
-use term_session::{FindQuery, Link, SelectionKind, Session, SessionEvent, TermMode};
+use term_session::{Block, FindQuery, Link, Row, SelectionKind, Session, SessionEvent, TermMode};
 
+use crate::block_header::shorten;
 use crate::colors::Palette;
 use crate::commands::{
+    BlockCopyCommand, BlockCopyOutput, BlockNext, BlockPrevious, BlockToggleCollapse,
     CopySelection, FindClose, FindNext, FindOpen, FindPrevious, PasteClipboard,
     TextDeleteToLineStart, TextDeleteWordBack, TextLineEnd, TextLineStart, TextWordBack,
     TextWordForward,
@@ -104,6 +106,12 @@ pub struct TerminalView {
     bell_on: bool,
     /// Ends the bell flash. A new bell replaces it.
     bell_task: Option<Task<()>>,
+    /// What each visual row of the last frame shows. Mouse positions are mapped
+    /// through it. Written by the element.
+    layout: Rc<RefCell<Vec<Row>>>,
+    /// The block the user selected: navigation starts from it, and copy and
+    /// collapse act on it. Cleared by typing, a click elsewhere, or Escape.
+    selected_block: Cell<Option<u64>>,
 }
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
@@ -151,6 +159,8 @@ impl TerminalView {
             blink_task: None,
             bell_on: false,
             bell_task: None,
+            layout: Rc::new(RefCell::new(Vec::new())),
+            selected_block: Cell::new(None),
         };
         view.restart_cursor_blink(cx);
         view
@@ -253,6 +263,7 @@ impl TerminalView {
 
     /// Writes user input to the shell and returns the view to the newest output.
     fn send_input(&self, bytes: &[u8]) {
+        self.selected_block.set(None);
         self.session.scroll_to_bottom();
         let _ = self.session.write(bytes);
     }
@@ -277,6 +288,14 @@ impl TerminalView {
         // Cmd belongs to the app's shortcuts (Cmd+Opt+arrows move between panes),
         // so it is never sent to the shell. Keys without a shortcut are dropped.
         if modifiers.platform {
+            return;
+        }
+
+        // Escape clears a selected block. Without one it goes to the shell.
+        if keystroke.key == "escape" && self.selected_block.get().is_some() {
+            self.selected_block.set(None);
+            cx.stop_propagation();
+            cx.notify();
             return;
         }
 
@@ -685,11 +704,14 @@ impl TerminalView {
         let metrics = self.metrics.get();
         let (line, column, side) = metrics.cell_at(event.position);
         let mode = self.session.mode();
+        let row = self.row_at(line);
 
         if event.button == MouseButton::Left && event.modifiers.secondary() {
-            if let Some(link) = self.session.url_at(line, column) {
-                cx.open_url(&link.url);
-                return;
+            if let Some(Row::Line(buffer_line)) = row {
+                if let Some(link) = self.session.url_at(buffer_line, column) {
+                    cx.open_url(&link.url);
+                    return;
+                }
             }
         }
 
@@ -703,17 +725,29 @@ impl TerminalView {
         }
 
         if event.button == MouseButton::Left {
-            if event.modifiers.shift && self.session.selection_text().is_some() {
-                self.session.update_selection(line, column, side);
+            if let Some(Row::Header(id)) = row {
+                // A click on a block's header selects it and folds or unfolds it.
+                self.selected_block.set(Some(id));
+                self.session.toggle_block(id);
             } else {
-                let kind = match event.click_count {
-                    2 => SelectionKind::Semantic,
-                    3 => SelectionKind::Lines,
-                    _ => SelectionKind::Simple,
-                };
-                self.session.start_selection(kind, line, column, side);
+                self.selected_block.set(None);
             }
-            self.selecting = true;
+            match row {
+                Some(Row::Line(buffer_line)) => {
+                    if event.modifiers.shift && self.session.selection_text().is_some() {
+                        self.session.update_selection(buffer_line, column, side);
+                    } else {
+                        let kind = match event.click_count {
+                            2 => SelectionKind::Semantic,
+                            3 => SelectionKind::Lines,
+                            _ => SelectionKind::Simple,
+                        };
+                        self.session.start_selection(kind, buffer_line, column, side);
+                    }
+                    self.selecting = true;
+                }
+                _ => {}
+            }
         }
         cx.notify();
     }
@@ -752,16 +786,18 @@ impl TerminalView {
         }
 
         if self.selecting && event.pressed_button == Some(MouseButton::Left) {
-            self.session.update_selection(line, column, side);
-            cx.notify();
+            if let Some(Row::Line(buffer_line)) = self.row_at(line) {
+                self.session.update_selection(buffer_line, column, side);
+                cx.notify();
+            }
         }
 
-        let hovered = if event.modifiers.secondary() {
-            self.session
-                .url_at(line, column)
-                .map(|link| HoveredLink { line, link })
-        } else {
-            None
+        let hovered = match self.row_at(line) {
+            Some(Row::Line(buffer_line)) if event.modifiers.secondary() => self
+                .session
+                .url_at(buffer_line, column)
+                .map(|link| HoveredLink { line, link }),
+            _ => None,
         };
         if hovered.as_ref().map(|h| (h.line, &h.link))
             != self.hovered_link.as_ref().map(|h| (h.line, &h.link))
@@ -810,16 +846,6 @@ fn tab_label(session: &Session) -> String {
     }
 }
 
-/// Cuts `text` to `max` characters, ending with an ellipsis when it is longer.
-fn shorten(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(max - 1).collect();
-    out.push('…');
-    out
-}
-
 /// `~` for the home directory, `/` for the root, otherwise the last path part.
 fn dir_label(dir: &Path) -> String {
     if std::env::var_os("HOME").is_some_and(|home| Path::new(&home) == dir) {
@@ -828,6 +854,114 @@ fn dir_label(dir: &Path) -> String {
     match dir.file_name() {
         Some(name) => name.to_string_lossy().into_owned(),
         None => "/".into(),
+    }
+}
+
+impl TerminalView {
+    /// What the visual row at `line` shows. `None` before the first frame.
+    fn row_at(&self, line: usize) -> Option<Row> {
+        self.layout.borrow().get(line).copied()
+    }
+
+    /// The buffer line at the top of the view. For a header row, the block's prompt line.
+    fn top_buffer_line(&self) -> Option<usize> {
+        match self.row_at(0)? {
+            Row::Line(line) => Some(line),
+            Row::Header(id) => self.session.blocks().iter().find(|b| b.id == id)?.prompt_line,
+        }
+    }
+
+    /// The block the user selected, or else the block at the top of the view.
+    fn target_block(&self) -> Option<Block> {
+        match self.selected_block.get() {
+            Some(id) => self.session.blocks().into_iter().find(|b| b.id == id),
+            None => self.block_at_top(),
+        }
+    }
+
+    /// The block at the top of the view: the last one that starts at or above
+    /// it, or the first block when none does.
+    fn block_at_top(&self) -> Option<Block> {
+        let blocks = self.session.blocks();
+        let top = self.top_buffer_line()?;
+        blocks
+            .iter()
+            .rev()
+            .find(|b| b.prompt_line.or(b.output_line).is_some_and(|line| line <= top))
+            .or(blocks.first())
+            .cloned()
+    }
+
+    /// Selects the previous or next block and scrolls its header to the top of the
+    /// view. From a selected block, the neighbour of it. Without one, previous is the
+    /// newest block above the bottom of the view, and next the first one below its
+    /// top. Next past the last block clears the selection and shows the newest output.
+    fn step_block(&mut self, next: bool, cx: &mut Context<Self>) {
+        let blocks = self.session.blocks();
+        let selected = self
+            .selected_block
+            .get()
+            .and_then(|id| blocks.iter().find(|b| b.id == id))
+            .and_then(|b| b.prompt_line);
+        let top = self.session.top_line();
+        let target = match (selected, next) {
+            (Some(line), true) => self.session.next_block(line),
+            (Some(line), false) => self.session.previous_block(line),
+            (None, true) => self.session.next_block(top),
+            (None, false) => self.session.previous_block(top + self.metrics.get().rows),
+        };
+        match target.and_then(|block| Some((block.id, block.prompt_line?))) {
+            Some((id, line)) => {
+                self.selected_block.set(Some(id));
+                self.session.scroll_top_to(line);
+            }
+            None if next => {
+                self.selected_block.set(None);
+                self.session.scroll_to_bottom();
+            }
+            None => {}
+        }
+        cx.notify();
+    }
+
+    fn copy_block_command(
+        &mut self,
+        _: &BlockCopyCommand,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let command = self
+            .target_block()
+            .and_then(|block| self.session.block_command(block.id));
+        if let Some(command) = command {
+            cx.write_to_clipboard(ClipboardItem::new_string(command));
+        }
+    }
+
+    fn copy_block_output(
+        &mut self,
+        _: &BlockCopyOutput,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let output = self
+            .target_block()
+            .and_then(|block| self.session.block_output(block.id));
+        if let Some(output) = output {
+            cx.write_to_clipboard(ClipboardItem::new_string(output));
+        }
+    }
+
+    fn toggle_block(
+        &mut self,
+        _: &BlockToggleCollapse,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(block) = self.target_block() {
+            self.session.toggle_block(block.id);
+            cx.notify();
+        }
     }
 }
 
@@ -864,6 +998,11 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::find_next))
             .on_action(cx.listener(Self::find_previous))
             .on_action(cx.listener(|view, _: &FindClose, window, cx| view.close_find(window, cx)))
+            .on_action(cx.listener(|view, _: &BlockPrevious, _, cx| view.step_block(false, cx)))
+            .on_action(cx.listener(|view, _: &BlockNext, _, cx| view.step_block(true, cx)))
+            .on_action(cx.listener(Self::copy_block_command))
+            .on_action(cx.listener(Self::copy_block_output))
+            .on_action(cx.listener(Self::toggle_block))
             .on_action(
                 cx.listener(|view, _: &TextWordBack, _, cx| view.text_edit(TextEdit::WordBack, cx)),
             )
@@ -907,6 +1046,8 @@ impl Render for TerminalView {
                 find,
                 cursor_on: self.cursor_on,
                 bell: self.bell_on,
+                rows: self.layout.clone(),
+                selected: self.selected_block.get(),
             })
             .children(find_bar)
     }
