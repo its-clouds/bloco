@@ -27,7 +27,7 @@ pub struct Chrome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Theme {
-    pub name: &'static str,
+    pub name: String,
     pub background: Rgb,
     pub foreground: Rgb,
     pub cursor: Rgb,
@@ -54,11 +54,65 @@ pub fn by_name(name: &str) -> Option<Theme> {
     }
 }
 
+/// The colors an imported theme file provides. The rest of the theme is derived
+/// from them in [`Scheme::into_theme`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scheme {
+    pub background: Rgb,
+    pub foreground: Rgb,
+    pub cursor: Rgb,
+    pub selection: Rgb,
+    /// Black through bright white, in ANSI order.
+    pub ansi: [Rgb; 16],
+}
+
+impl Scheme {
+    /// Builds a full theme. The find colors come from the yellow and orange
+    /// ANSI colors, and the chrome is a step lighter or darker than the background.
+    pub fn into_theme(self, name: &str) -> Theme {
+        let (bg, fg, ansi) = (self.background, self.foreground, self.ansi);
+        Theme {
+            name: name.to_string(),
+            background: bg,
+            foreground: fg,
+            cursor: self.cursor,
+            selection: self.selection,
+            find_match: ansi[11],
+            find_current: ansi[9],
+            find_text: bg,
+            ansi,
+            chrome: Chrome {
+                tab_bar: mix(bg, Rgb(0), 0.25),
+                tab_active: bg,
+                tab_inactive: mix(bg, fg, 0.08),
+                close_hover: mix(bg, fg, 0.2),
+                text: fg,
+                muted: mix(fg, bg, 0.45),
+                divider: mix(bg, fg, 0.2),
+                overlay: mix(bg, fg, 0.06),
+                selected: mix(bg, fg, 0.2),
+                accent: ansi[4],
+                error: ansi[1],
+            },
+        }
+    }
+}
+
+/// `a` moved `t` of the way toward `b` (0.0 is `a`, 1.0 is `b`), per channel.
+pub(crate) fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
+    let channel = |shift: u32| {
+        let x = ((a.0 >> shift) & 0xff) as f32;
+        let y = ((b.0 >> shift) & 0xff) as f32;
+        (x + (y - x) * t).round() as u32
+    };
+    Rgb((channel(16) << 16) | (channel(8) << 8) | channel(0))
+}
+
 impl Theme {
     /// Tomorrow Night, close to what most dark terminals ship with.
     pub fn dark() -> Self {
         Self {
-            name: "dark",
+            name: "dark".into(),
             background: Rgb(0x1d1f21),
             foreground: Rgb(0xc5c8c6),
             cursor: Rgb(0xc5c8c6),
@@ -103,7 +157,7 @@ impl Theme {
     /// One Light, with the same ANSI order as the dark theme.
     pub fn light() -> Self {
         Self {
-            name: "light",
+            name: "light".into(),
             background: Rgb(0xfafafa),
             foreground: Rgb(0x383a42),
             cursor: Rgb(0x526fff),

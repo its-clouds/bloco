@@ -361,6 +361,12 @@ impl TerminalView {
         }
     }
 
+    /// Puts `text` where typed text goes: the input editor at the prompt, or the
+    /// shell. The sidebar's file tree uses this to insert a path.
+    pub fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.commit_text(text, cx);
+    }
+
     /// Text committed by the keyboard or the input method.
     fn commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
         self.restart_cursor_blink(cx);

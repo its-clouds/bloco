@@ -40,6 +40,11 @@ actions!(
         ZoomIn,
         ZoomOut,
         ZoomReset,
+        ToggleSidebar,
+        ShowSessions,
+        ShowFiles,
+        OpenSettings,
+        ImportTheme,
         QuitApp,
     ]
 );
@@ -97,6 +102,11 @@ pub const COMMANDS: &[Command] = &[
     Command { id: "view.zoom_in", title: "Zoom in", keys: &["cmd-=", "cmd-+"] },
     Command { id: "view.zoom_out", title: "Zoom out", keys: &["cmd--"] },
     Command { id: "view.zoom_reset", title: "Reset zoom", keys: &["cmd-0"] },
+    Command { id: "sidebar.toggle", title: "Toggle sidebar", keys: &["cmd-shift-b"] },
+    Command { id: "sidebar.sessions", title: "Show sessions in sidebar", keys: &[] },
+    Command { id: "sidebar.files", title: "Show file tree in sidebar", keys: &["cmd-shift-e"] },
+    Command { id: "settings.open", title: "Open settings", keys: &["cmd-,"] },
+    Command { id: "theme.import", title: "Import theme from file", keys: &[] },
     Command { id: "app.quit", title: "Quit Bloco", keys: &["cmd-q"] },
 ];
 
@@ -135,6 +145,11 @@ pub fn action_for(id: &str) -> Option<Box<dyn Action>> {
         "view.zoom_in" => Box::new(ZoomIn),
         "view.zoom_out" => Box::new(ZoomOut),
         "view.zoom_reset" => Box::new(ZoomReset),
+        "sidebar.toggle" => Box::new(ToggleSidebar),
+        "sidebar.sessions" => Box::new(ShowSessions),
+        "sidebar.files" => Box::new(ShowFiles),
+        "settings.open" => Box::new(OpenSettings),
+        "theme.import" => Box::new(ImportTheme),
         "app.quit" => Box::new(QuitApp),
         _ => {
             let number: usize = id.strip_prefix("tab.select.")?.parse().ok()?;

@@ -9,3 +9,4 @@ description = "config.toml, keymap.toml and built-in themes for Bloco. No UI cod
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+toml_edit = "0.22"

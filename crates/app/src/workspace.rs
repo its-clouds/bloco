@@ -1,9 +1,10 @@
-//! The window: tabs, panes, the command palette and the config error bar.
+//! The window: tabs, panes, the sidebar, the command palette, the settings
+//! panel and the config error bar.
 //!
 //! A tab holds a split tree of panes. Each pane is a `TerminalView` with its own
-//! session. Settings are reloaded when `config.toml` or `keymap.toml` change
-//! (checked every half second). A file that does not parse keeps the last good
-//! settings and shows its error in a bar.
+//! session. Settings are reloaded when `config.toml`, `keymap.toml` or a theme
+//! file change (checked every half second). A file that does not parse keeps
+//! the last good settings and shows its error in a bar.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -12,20 +13,23 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use config::{Files, Settings};
+use config::{Config, Files, Settings};
 use gpui::{
     Action, AnyElement, App, Bounds, Context, Entity, EntityId, FocusHandle, Focusable, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Render, Subscription, Window, canvas, div, prelude::*, px, relative,
+    MouseUpEvent, PathPromptOptions, Pixels, Render, Subscription, Window, WindowBackgroundAppearance, canvas, div, prelude::*, px, relative,
 };
 use term_session::{Session, SessionEvent};
 
 use crate::colors::Palette;
 use crate::commands::{
-    self, ClosePane, CloseTab, FocusDown, FocusLeft, FocusRight, FocusUp, NewTab, NextTab,
-    PreviousTab, SelectTab, SplitDown, SplitRight, TogglePalette, ZoomIn, ZoomOut, ZoomReset,
+    self, ClosePane, CloseTab, FocusDown, FocusLeft, FocusRight, FocusUp, ImportTheme, NewTab,
+    NextTab, OpenSettings, PreviousTab, SelectTab, ShowFiles, ShowSessions, SplitDown, SplitRight,
+    TogglePalette, ToggleSidebar, ZoomIn, ZoomOut, ZoomReset,
 };
 use crate::layout::{self, SavedLayout, SavedNode, SavedTab};
 use crate::palette::{PaletteState, pretty_keys};
+use crate::settings::{self as settings_rows, Setting};
+use crate::sidebar::{self, Mode, Sidebar};
 use crate::split_tree::{Axis, DIVIDER, Direction, MAX_RATIO, MIN_RATIO, Node, Rect, SplitTree};
 use crate::terminal_view::{TerminalEvent, TerminalStyle, TerminalView};
 use crate::zoom;
@@ -37,6 +41,11 @@ const PALETTE_WIDTH: f32 = 560.0;
 const PALETTE_TOP: f32 = 80.0;
 const PALETTE_ROWS: usize = 10;
 const SETTINGS_POLL: Duration = Duration::from_millis(500);
+const SIDEBAR_WIDTH: f32 = 240.0;
+/// The strip of buttons down the sidebar's left edge that picks the list.
+const ACTIVITY_WIDTH: f32 = 36.0;
+const SETTINGS_TOP: f32 = 60.0;
+const SETTINGS_WIDTH: f32 = 480.0;
 
 /// One tab: its panes and the pane that has the keyboard.
 struct Tab {
@@ -57,6 +66,10 @@ struct Applied {
     style: TerminalStyle,
     base_font_size: f32,
     bindings: Vec<KeyBinding>,
+    config: Config,
+    /// The names `theme` can take: the built-ins, then the theme files.
+    theme_names: Vec<String>,
+    appearance: WindowBackgroundAppearance,
 }
 
 pub struct Workspace {
@@ -74,6 +87,16 @@ pub struct Workspace {
     seen_files: Option<Files>,
     /// A settings or shell error, shown in a bar until it goes away.
     error: Option<String>,
+    /// The config as last applied. The settings panel shows its values.
+    config: Config,
+    /// The theme names the settings panel cycles through.
+    theme_names: Vec<String>,
+    /// The window background as the settings want it, and as the window has it.
+    appearance: WindowBackgroundAppearance,
+    shown_appearance: Option<WindowBackgroundAppearance>,
+    sidebar: Sidebar,
+    settings_open: bool,
+    settings_focus: FocusHandle,
     palette: Option<PaletteState>,
     palette_focus: FocusHandle,
     divider_drag: Option<DividerDrag>,
@@ -112,6 +135,13 @@ impl Workspace {
             pane_subscriptions: HashMap::new(),
             seen_files,
             error,
+            config: applied.config,
+            theme_names: applied.theme_names,
+            appearance: applied.appearance,
+            shown_appearance: None,
+            sidebar: Sidebar::default(),
+            settings_open: false,
+            settings_focus: cx.focus_handle(),
             palette: None,
             palette_focus: cx.focus_handle(),
             divider_drag: None,
@@ -139,6 +169,7 @@ impl Workspace {
                 if this
                     .update(cx, |workspace, cx| {
                         workspace.poll_settings(cx);
+                        workspace.reload_file_tree(cx);
                         workspace.save_layout(cx);
                     })
                     .is_err()
@@ -533,9 +564,186 @@ impl Workspace {
         self.style = applied.style;
         // The zoom offset is kept, and applied to the new configured size.
         self.base_font_size = applied.base_font_size;
+        self.config = applied.config;
+        self.theme_names = applied.theme_names;
+        self.appearance = applied.appearance;
         self.set_font_size(cx);
         cx.notify();
     }
+
+    /// Writes `text` to `config.toml`, then reads the file back at once, so the
+    /// settings panel and the window show the new value without waiting for the poll.
+    fn save_config(&mut self, text: &str, cx: &mut Context<Self>) {
+        let Some(dir) = config::default_dir() else {
+            return;
+        };
+        let saved = std::fs::create_dir_all(&dir)
+            .and_then(|()| config::edit::save(&dir.join("config.toml"), text));
+        match saved {
+            Ok(()) => self.poll_settings(cx),
+            Err(e) => self.set_error(Some(format!("cannot save config.toml: {e}")), cx),
+        }
+    }
+
+    /// The text of `config.toml` as the files last had it, to change one value in.
+    /// `None` while the file has an error: a change then would write over a
+    /// mistake the user has not seen yet.
+    fn config_text(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        match &self.seen_files {
+            Some(files) => Some(files.config.clone().unwrap_or_default()),
+            None => {
+                self.set_error(
+                    Some("config.toml has an error. Fix it before changing settings here.".into()),
+                    cx,
+                );
+                None
+            }
+        }
+    }
+
+    /// Changes one setting by one step, from the settings panel's arrows.
+    fn change_setting(&mut self, setting: Setting, step: i32, cx: &mut Context<Self>) {
+        let Some(text) = self.config_text(cx) else {
+            return;
+        };
+        match settings_rows::step(&text, setting, &self.config, &self.theme_names, step) {
+            Ok(text) => self.save_config(&text, cx),
+            Err(e) => self.set_error(Some(e), cx),
+        }
+    }
+
+    fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_open = true;
+        window.focus(&self.settings_focus, cx);
+        cx.notify();
+    }
+
+    fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_open = false;
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    fn settings_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key == "escape" {
+            self.close_settings(window, cx);
+        }
+        cx.stop_propagation();
+    }
+
+    /// Asks for a theme file, then copies it into `themes/` and selects it.
+    fn import_theme(&mut self, _: &ImportTheme, _: &mut Window, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Import theme".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = picked.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            this.update(cx, |workspace, cx| workspace.install_theme(&path, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    fn install_theme(&mut self, source: &Path, cx: &mut Context<Self>) {
+        let Some(file_name) = source.file_name().and_then(|name| name.to_str()).map(str::to_string) else {
+            return;
+        };
+        let Some(name) = config::import::theme_name(&file_name).map(str::to_string) else {
+            self.set_error(
+                Some(format!("{file_name} is not a theme file (use .itermcolors or .yaml)")),
+                cx,
+            );
+            return;
+        };
+        // Bytes, not text: iTerm2 exports a binary property list by default.
+        let data = match std::fs::read(source) {
+            Ok(data) => data,
+            Err(e) => {
+                self.set_error(Some(format!("{file_name}: {e}")), cx);
+                return;
+            }
+        };
+        // Checked before it is copied, so a broken theme never lands in themes/.
+        if let Err(e) = config::import::parse(&file_name, &data) {
+            self.set_error(Some(format!("{file_name}: {e}")), cx);
+            return;
+        }
+        let Some(dir) = config::default_dir() else {
+            return;
+        };
+        let themes = dir.join("themes");
+        let copied = std::fs::create_dir_all(&themes)
+            .and_then(|()| std::fs::write(themes.join(&file_name), &data));
+        if let Err(e) = copied {
+            self.set_error(Some(format!("cannot copy {file_name}: {e}")), cx);
+            return;
+        }
+        if let Some(current) = self.config_text(cx) {
+            match config::edit::set_theme(&current, &name) {
+                Ok(text) => self.save_config(&text, cx),
+                Err(e) => self.set_error(Some(e), cx),
+            }
+        }
+    }
+
+    /// The window's background: opaque, or see-through with or without blur.
+    fn appearance_for(window: &config::WindowConfig) -> WindowBackgroundAppearance {
+        match (window.background_opacity < 1.0, window.background_blur) {
+            (false, _) => WindowBackgroundAppearance::Opaque,
+            (true, false) => WindowBackgroundAppearance::Transparent,
+            (true, true) => WindowBackgroundAppearance::Blurred,
+        }
+    }
+
+    fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar.open = !self.sidebar.open;
+        cx.notify();
+    }
+
+    fn show_sessions(&mut self, _: &ShowSessions, _: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar.open = true;
+        self.sidebar.mode = Mode::Sessions;
+        cx.notify();
+    }
+
+    fn show_files(&mut self, _: &ShowFiles, _: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar.open = true;
+        self.sidebar.mode = Mode::Files;
+        cx.notify();
+    }
+
+    /// Keeps the file tree on the active pane's directory. Called while the
+    /// file tree is drawn, so a `cd` or a new tab shows at once.
+    fn sync_file_tree(&mut self, cx: &App) {
+        if self.sidebar.open && self.sidebar.mode == Mode::Files {
+            let cwd = self.active_cwd(cx);
+            self.sidebar.tree.set_root(cwd);
+        }
+    }
+
+    fn reload_file_tree(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar.open && self.sidebar.mode == Mode::Files && self.sidebar.tree.reload() {
+            cx.notify();
+        }
+    }
+
+    /// Types a file's path at the active pane's prompt, quoted for the shell.
+    fn insert_path(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(pane) = self.active_pane() {
+            let text = format!("{} ", sidebar::shell_quote(&path.to_string_lossy()));
+            pane.update(cx, |view, cx| view.insert_text(&text, cx));
+        }
+        self.focus_active(window, cx);
+    }
+
 
     /// The terminal font size: the configured size plus the zoom, clamped.
     fn font_size(&self) -> Pixels {
@@ -885,9 +1093,406 @@ impl Workspace {
     }
 }
 
+impl Workspace {
+    /// The sidebar: the session list (vertical tabs) or the file tree, with a
+    /// switch between them in its header.
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let chrome = &self.style.palette.chrome;
+        let (text, muted, selected, divider, close_hover) = (
+            chrome.text,
+            chrome.muted,
+            chrome.selected,
+            chrome.divider,
+            chrome.close_hover,
+        );
+        let mode = self.sidebar.mode;
+        let title = match mode {
+            Mode::Sessions => "Sessions",
+            Mode::Files => "Files",
+        };
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .flex_shrink_0()
+            .h(px(TAB_BAR_HEIGHT))
+            .px_3()
+            .border_b_1()
+            .border_color(divider)
+            .child(div().text_color(muted).child(title))
+            .when(mode == Mode::Sessions, |header| {
+                header.child(
+                    div()
+                        .id("sidebar-new-tab")
+                        .px_2()
+                        .text_color(muted)
+                        .cursor_pointer()
+                        .child("+")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|ws, _: &MouseDownEvent, window, cx| {
+                                ws.new_tab(&NewTab, window, cx)
+                            }),
+                        ),
+                )
+            });
+
+        let body: Vec<AnyElement> = match mode {
+            Mode::Sessions => self
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(index, tab)| {
+                    let active = index == self.active_tab;
+                    let pane = tab.active.read(cx);
+                    let title = pane.tab_title();
+                    let detail = pane.cwd().map(|dir| dir_label(&dir)).unwrap_or_default();
+                    div()
+                        .id(("session", index))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .w_full()
+                        .px_3()
+                        .py_2()
+                        .cursor_pointer()
+                        .when(active, |row| row.bg(selected))
+                        .hover(|row| row.bg(close_hover))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .text_color(if active { text } else { muted })
+                                        .child(title),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .child(detail),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id(("session-close", index))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .flex_shrink_0()
+                                .ml_1()
+                                .size(px(18.))
+                                .rounded_sm()
+                                .text_color(muted)
+                                .cursor_pointer()
+                                .hover(|button| button.bg(divider).text_color(text))
+                                .child("×")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |ws, _: &MouseDownEvent, window, cx| {
+                                        // The click must not reach the row, or it would select the tab first.
+                                        cx.stop_propagation();
+                                        ws.close_tab(index, window, cx);
+                                    }),
+                                ),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |ws, _: &MouseDownEvent, window, cx| {
+                                ws.select_tab(index, window, cx)
+                            }),
+                        )
+                        .into_any_element()
+                })
+                .collect(),
+            Mode::Files => self
+                .sidebar
+                .tree
+                .rows()
+                .iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    let path = row.path.clone();
+                    let is_dir = row.is_dir;
+                    let marker = match (is_dir, row.expanded) {
+                        (false, _) => "",
+                        (true, true) => "▾",
+                        (true, false) => "▸",
+                    };
+                    div()
+                        .id(("file", index))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .w_full()
+                        .pl(px(12.0 + 14.0 * row.depth as f32))
+                        .pr_2()
+                        .py_px()
+                        .cursor_pointer()
+                        .hover(|line| line.bg(close_hover))
+                        .child(
+                            div()
+                                .w(px(12.))
+                                .flex_shrink_0()
+                                .text_color(muted)
+                                .child(marker),
+                        )
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(row.name.clone()),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |ws, _: &MouseDownEvent, window, cx| {
+                                if is_dir {
+                                    ws.sidebar.tree.toggle(&path);
+                                    cx.notify();
+                                } else {
+                                    ws.insert_path(&path, window, cx);
+                                }
+                            }),
+                        )
+                        .into_any_element()
+                })
+                .collect(),
+        };
+        let empty_note = match (mode, self.sidebar.tree.root()) {
+            (Mode::Files, None) => Some("No folder for this pane"),
+            _ => None,
+        };
+
+        let strip = div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .w(px(ACTIVITY_WIDTH))
+            .h_full()
+            .py_1()
+            .border_r_1()
+            .border_color(divider)
+            .child(self.sidebar_switch("▤", Mode::Sessions, mode, cx))
+            .child(self.sidebar_switch("▦", Mode::Files, mode, cx));
+        let panel = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .min_h_0()
+            .child(header)
+            .child(
+                div()
+                    .id("sidebar-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .py_1()
+                    .children(body)
+                    .when_some(empty_note, |body, note| {
+                        body.child(div().px_3().py_2().text_color(muted).child(note))
+                    }),
+            );
+
+        div()
+            .flex()
+            .flex_row()
+            .flex_shrink_0()
+            .w(px(SIDEBAR_WIDTH))
+            .h_full()
+            .min_h_0()
+            .bg(chrome.tab_bar)
+            .child(strip)
+            .child(panel)
+    }
+
+    /// One button of the strip on the sidebar's left edge. The active one has a
+    /// bar on its left and a highlight.
+    fn sidebar_switch(
+        &self,
+        label: &'static str,
+        target: Mode,
+        mode: Mode,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let chrome = &self.style.palette.chrome;
+        let active = target == mode;
+        div()
+            .id(label)
+            .flex()
+            .items_center()
+            .justify_center()
+            .w_full()
+            .h(px(36.))
+            .border_l_2()
+            .border_color(if active { chrome.accent } else { chrome.tab_bar })
+            .cursor_pointer()
+            .text_color(if active { chrome.text } else { chrome.muted })
+            .when(active, |tab| tab.bg(chrome.selected))
+            .child(label)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |ws, _: &MouseDownEvent, _, cx| {
+                    ws.sidebar.mode = target;
+                    cx.notify();
+                }),
+            )
+    }
+
+    /// The settings panel: one row per setting, each with arrows that step it,
+    /// and a row that imports a theme file. Escape closes it.
+    fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let chrome = &self.style.palette.chrome;
+        let (text, muted, divider, close_hover, accent, overlay) = (
+            chrome.text,
+            chrome.muted,
+            chrome.divider,
+            chrome.close_hover,
+            chrome.accent,
+            chrome.overlay,
+        );
+        let arrow = |index: usize, label: &'static str, setting: Setting, step: i32, cx: &mut Context<Self>| {
+            div()
+                .id(("setting-step", index * 2 + usize::from(step > 0)))
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .hover(|button| button.bg(close_hover))
+                .child(label)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |ws, _: &MouseDownEvent, _, cx| {
+                        ws.change_setting(setting, step, cx)
+                    }),
+                )
+        };
+        let rows = settings_rows::ROWS.iter().enumerate().map(|(index, &setting)| {
+            div()
+                .id(("setting", index))
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .px_3()
+                .py_2()
+                .border_b_1()
+                .border_color(divider)
+                .child(setting.label())
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .child(arrow(index, "‹", setting, -1, cx))
+                        .child(
+                            div()
+                                .min_w(px(130.))
+                                .flex()
+                                .justify_center()
+                                .child(setting.value_text(&self.config)),
+                        )
+                        .child(arrow(index, "›", setting, 1, cx)),
+                )
+        }).collect::<Vec<_>>();
+        let path = config::default_dir()
+            .map(|dir| dir.join("config.toml").display().to_string())
+            .unwrap_or_default();
+
+        div()
+            .id("settings")
+            .track_focus(&self.settings_focus)
+            .on_key_down(cx.listener(Self::settings_key))
+            .absolute()
+            .top(px(SETTINGS_TOP))
+            .left_0()
+            .right_0()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(SETTINGS_WIDTH))
+                    .flex()
+                    .flex_col()
+                    .bg(overlay)
+                    .text_color(text)
+                    .border_1()
+                    .border_color(divider)
+                    .rounded_md()
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .border_b_1()
+                            .border_color(divider)
+                            .child("Settings"),
+                    )
+                    .children(rows)
+                    .child(
+                        div()
+                            .id("import-theme")
+                            .px_3()
+                            .py_2()
+                            .text_color(accent)
+                            .cursor_pointer()
+                            .hover(|row| row.bg(close_hover))
+                            .child("Import theme from a file…")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|ws, _: &MouseDownEvent, window, cx| {
+                                    ws.import_theme(&ImportTheme, window, cx)
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(format!("Saved to {path}. Esc closes.")),
+                    ),
+            )
+            .into_any_element()
+    }
+}
+
+/// A directory as a short label: its last name, or the whole path for `/`.
+fn dir_label(dir: &Path) -> String {
+    dir.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.display().to_string())
+}
+
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.shown_appearance != Some(self.appearance) {
+            window.set_background_appearance(self.appearance);
+            self.shown_appearance = Some(self.appearance);
+        }
+        self.sync_file_tree(cx);
+        // While the panel is open it keeps the keyboard, so Escape reaches it.
+        if self.settings_open && !self.settings_focus.is_focused(window) {
+            window.focus(&self.settings_focus, cx);
+        }
         let palette = &self.style.palette;
+        let mut body = div().flex().flex_row().flex_1().min_h_0().min_w_0();
+        if self.sidebar.open {
+            body = body.child(self.render_sidebar(cx));
+        }
+        body = body.child(self.render_content(cx));
         let mut root = div()
             .id("workspace")
             .size_full()
@@ -900,6 +1505,11 @@ impl Render for Workspace {
                 MouseButton::Left,
                 cx.listener(|ws, _: &MouseUpEvent, _, _| ws.divider_drag = None),
             )
+            .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::show_sessions))
+            .on_action(cx.listener(Self::show_files))
+            .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::import_theme))
             .on_action(cx.listener(Self::new_tab))
             .on_action(cx.listener(Self::close_tab_action))
             .on_action(cx.listener(Self::close_pane_action))
@@ -916,8 +1526,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::zoom_reset))
-            .when(self.tabs.len() > 1, |root| root.child(self.render_tab_bar(cx)))
-            .child(self.render_content(cx));
+            .when(self.tabs.len() > 1 && !self.sidebar.open, |root| {
+                root.child(self.render_tab_bar(cx))
+            })
+            .child(body);
         if let Some(error) = &self.error {
             root = root.child(
                 div()
@@ -925,12 +1537,15 @@ impl Render for Workspace {
                     .px_3()
                     .py_2()
                     .bg(palette.chrome.error)
-                    .text_color(palette.background)
+                    .text_color(palette.opaque_background)
                     .child(error.clone()),
             );
         }
         if self.palette.is_some() {
             root = root.child(self.render_palette(cx));
+        }
+        if self.settings_open {
+            root = root.child(self.render_settings(cx));
         }
         root
     }
@@ -941,15 +1556,19 @@ fn compile(files: &Files, cx: &App) -> Result<Applied, String> {
     let settings = Settings::parse(files, &commands::default_keymap())?;
     let bindings = commands::key_bindings(&settings.keymap, cx)?;
     let font_family = resolve_font(&settings.config.font.family, cx);
+    let window = &settings.config.window;
     Ok(Applied {
         style: TerminalStyle {
-            palette: Rc::new(Palette::from_theme(&settings.theme)),
+            palette: Rc::new(Palette::from_theme(&settings.theme, window.background_opacity)),
             font_family: font_family.into(),
             font_size: px(settings.config.font.size),
             option_as_meta: settings.config.option_as_meta,
         },
         base_font_size: settings.config.font.size,
         bindings,
+        appearance: Workspace::appearance_for(window),
+        theme_names: config::theme_names(files),
+        config: settings.config.clone(),
     })
 }
 
