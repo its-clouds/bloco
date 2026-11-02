@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/term-session", "crates/config", "crates/app"]
+
+[workspace.package]
+license = "GPL-3.0-only"
+publish = false
+
+[profile.release]
+debug = "line-tables-only"
+
+# Zed's workspace patches these crates for its own GPUI build (zed-industries/zed,
+# Cargo.toml). A git dependency on GPUI ignores the upstream [patch] table, so we
+# repeat the entries GPUI needs. Keep the revs in sync with the GPUI pin in
+# crates/app/Cargo.toml.
+[patch.crates-io]
+async-task = { git = "https://github.com/zed-industries/async-task.git", rev = "015845a19fc31752c02367567d3b8900a406f9da" }

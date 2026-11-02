@@ -1,0 +1,22 @@
+Bloco
+Copyright (C) 2026 the Bloco authors. Licensed under GPL-3.0-only (see LICENSE).
+
+This project adapts code from the following upstream sources. Each adapted file
+starts with a header comment that names its source file and commit.
+
+Zed (https://github.com/zed-industries/zed), commit
+c4273271092b0287f7d181f616bd5171e0a2f70c (tag v1.26.2).
+Licensed under GPL-3.0-or-later (crates/terminal/LICENSE-GPL, crates/terminal_view/LICENSE-GPL).
+GPL-3.0-or-later code is distributed here under GPL-3.0 terms.
+
+| Local file | Adapted from |
+| --- | --- |
+| crates/app/src/keys.rs | crates/terminal/src/mappings/keys.rs |
+| crates/app/src/mouse.rs | crates/terminal/src/mappings/mouse.rs |
+| crates/app/src/terminal_element.rs | crates/terminal_view/src/terminal_element.rs (layout approach: batched runs, force width) |
+| crates/app/src/terminal_view.rs | crates/terminal_view/src/terminal_view.rs and terminal_element.rs (InputHandler, key_down) |
+
+Dependencies: GPUI (Apache-2.0, from the same Zed commit). The crates.io
+dependencies of term-session are audited in spikes/ui-toolkit/spike-core/README.md.
+The dependencies added in M1 (async-channel, serde, toml, and the GPUI transitive
+tree) have not been audited yet. That check is still to do.
