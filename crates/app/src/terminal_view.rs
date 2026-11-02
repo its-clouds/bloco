@@ -19,6 +19,7 @@ use gpui::{
     MouseUpEvent, Pixels, Point, Render, ScrollEvent, SharedString, Task, UTF16Selection, Window,
     div, prelude::*, px, relative,
 };
+use input_editor::{Buffer, HistorySearch, wrap};
 use term_session::{Block, FindQuery, Link, Row, SelectionKind, Session, SessionEvent, TermMode};
 
 use crate::block_header::shorten;
@@ -30,9 +31,10 @@ use crate::commands::{
     TextWordForward,
 };
 use crate::find::{FindState, Pick};
-use crate::keys::{TextEdit, text_edit_bytes, to_esc_str};
+use crate::keys::{TextEdit, text_edit_bytes, text_edit_for, to_esc_str};
 use crate::mouse::{alt_scroll, mouse_button_report, mouse_moved_report, scroll_report};
 use crate::option_key::option_keys_down;
+use crate::prompt::{PromptState, is_text_input, submit_bytes};
 use crate::terminal_element::{Metrics, TerminalElement, cell_metrics, grid_size};
 
 /// What a pane tells its workspace.
@@ -112,6 +114,8 @@ pub struct TerminalView {
     /// The block the user selected: navigation starts from it, and copy and
     /// collapse act on it. Cleared by typing, a click elsewhere, or Escape.
     selected_block: Cell<Option<u64>>,
+    /// The input editor at the prompt. It is used while the shell is at its prompt.
+    prompt: PromptState,
 }
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
@@ -161,6 +165,7 @@ impl TerminalView {
             bell_task: None,
             layout: Rc::new(RefCell::new(Vec::new())),
             selected_block: Cell::new(None),
+            prompt: PromptState::new(),
         };
         view.restart_cursor_blink(cx);
         view
@@ -285,6 +290,11 @@ impl TerminalView {
         let keystroke = &event.keystroke;
         let modifiers = keystroke.modifiers;
 
+        // While the shell is at its prompt, the input editor takes the keys first.
+        if self.owns_input() && self.prompt_key(event, cx) {
+            return;
+        }
+
         // Cmd belongs to the app's shortcuts (Cmd+Opt+arrows move between panes),
         // so it is never sent to the shell. Keys without a shortcut are dropped.
         if modifiers.platform {
@@ -350,7 +360,9 @@ impl TerminalView {
     fn commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
         self.restart_cursor_blink(cx);
         self.marked_text = None;
-        if !text.is_empty() {
+        if self.owns_input() {
+            self.insert_typed(text);
+        } else if !text.is_empty() {
             self.send_input(text.as_bytes());
         }
         cx.notify();
@@ -383,6 +395,12 @@ impl TerminalView {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
+        if self.owns_input() {
+            let text = text.replace("\r\n", "\n").replace('\r', "\n").replace('\x1b', "");
+            self.edit_buffer(|buffer| buffer.insert_str(&text));
+            cx.notify();
+            return;
+        }
         let bytes = if self.session.mode().contains(TermMode::BRACKETED_PASTE) {
             format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', "")).into_bytes()
         } else {
@@ -395,6 +413,18 @@ impl TerminalView {
     /// Sends a command-line edit to the shell, or the matching key to a full-screen app.
     fn text_edit(&mut self, edit: TextEdit, cx: &mut Context<Self>) {
         self.restart_cursor_blink(cx);
+        if self.owns_input() {
+            match edit {
+                TextEdit::DeleteWordBack => self.edit_buffer(Buffer::delete_word_back),
+                TextEdit::DeleteToLineStart => self.edit_buffer(Buffer::delete_to_line_start),
+                TextEdit::WordBack => self.prompt.buffer.word_back(),
+                TextEdit::WordForward => self.prompt.buffer.word_forward(),
+                TextEdit::LineStart => self.prompt.buffer.line_start(),
+                TextEdit::LineEnd => self.prompt.buffer.line_end(),
+            }
+            cx.notify();
+            return;
+        }
         if let Some(bytes) = text_edit_bytes(edit, self.session.mode()) {
             self.send_input(bytes.as_bytes());
         }
@@ -706,6 +736,15 @@ impl TerminalView {
         let mode = self.session.mode();
         let row = self.row_at(line);
 
+        if event.button == MouseButton::Left
+            && !event.modifiers.shift
+            && self.owns_input()
+            && self.place_cursor(line, column)
+        {
+            cx.notify();
+            return;
+        }
+
         if event.button == MouseButton::Left && event.modifiers.secondary() {
             if let Some(Row::Line(buffer_line)) = row {
                 if let Some(link) = self.session.url_at(buffer_line, column) {
@@ -965,6 +1004,202 @@ impl TerminalView {
     }
 }
 
+/// The input editor's key handling, and the calls that feed it.
+impl TerminalView {
+    /// Whether the input editor takes the keys: the shell is at its prompt.
+    fn owns_input(&self) -> bool {
+        self.session.input_mode().owns_input()
+    }
+
+    /// Keys the input editor takes while the prompt owns the keyboard. Returns
+    /// false for keys that `key_down` still handles: printable text (which
+    /// arrives through the input handler), keys bound to edit actions, and Cmd
+    /// shortcuts other than undo and redo.
+    fn prompt_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let keystroke = &event.keystroke;
+        let modifiers = keystroke.modifiers;
+        let key = keystroke.key.as_ref();
+
+        if modifiers.platform {
+            match key {
+                "z" if modifiers.shift => self.prompt.buffer.redo(),
+                "z" => self.prompt.buffer.undo(),
+                _ => return false,
+            };
+            return Self::consumed(cx);
+        }
+        if text_edit_for(keystroke).is_some() {
+            return false;
+        }
+        if self.prompt.search.is_some() {
+            return self.search_key(event, cx);
+        }
+        if is_text_input(keystroke.key_char.as_deref(), modifiers.control) {
+            return false;
+        }
+
+        match key {
+            "enter" if modifiers.shift => self.edit_buffer(|buffer| buffer.insert_char('\n')),
+            "enter" => self.submit(),
+            "backspace" => self.edit_buffer(Buffer::backspace),
+            "delete" => self.edit_buffer(Buffer::delete_forward),
+            "left" => self.prompt.buffer.move_left(),
+            "right" => self.prompt.buffer.move_right(),
+            "up" if self.prompt.buffer.is_first_line() => self.recall(true),
+            "up" => self.prompt.buffer.move_up(),
+            "down" if self.prompt.buffer.is_last_line() => self.recall(false),
+            "down" => self.prompt.buffer.move_down(),
+            "home" => self.prompt.buffer.line_start(),
+            "end" => self.prompt.buffer.line_end(),
+            "escape" => self.selected_block.set(None),
+            // Shift+PageUp and Shift+PageDown scroll the pane, as they do everywhere.
+            "pageup" | "pagedown" if modifiers.shift => return false,
+            _ if modifiers.control => self.control_key(key),
+            // Other keys (function keys, Tab until completion lands) are not sent to
+            // the shell: its line editor is not in use while this one is.
+            _ => {}
+        }
+        Self::consumed(cx)
+    }
+
+    /// Ctrl shortcuts of the input editor. Ctrl+D on an empty line still reaches
+    /// the shell, so it can end the session. Ctrl+L clears the screen in the shell.
+    fn control_key(&mut self, key: &str) {
+        match key {
+            "a" => self.prompt.buffer.line_start(),
+            "e" => self.prompt.buffer.line_end(),
+            "b" => self.prompt.buffer.move_left(),
+            "f" => self.prompt.buffer.move_right(),
+            "h" => self.edit_buffer(Buffer::backspace),
+            "u" => self.edit_buffer(Buffer::delete_to_line_start),
+            "w" => self.edit_buffer(Buffer::delete_word_back),
+            "d" if self.prompt.buffer.is_empty() => self.send_input(b"\x04"),
+            "d" => self.edit_buffer(Buffer::delete_forward),
+            "c" => self.edit_buffer(Buffer::clear),
+            "l" => self.send_input(b"\x0c"),
+            "r" => {
+                if self.prompt.search.is_none() {
+                    self.prompt.search = Some(HistorySearch::new(&self.prompt.history));
+                } else if let Some(search) = self.prompt.search.as_mut() {
+                    search.older();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Keys while the Ctrl+R search is open. Typed text goes to the search
+    /// through the input handler, so only the keys that drive it are handled here.
+    fn search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let modifiers = event.keystroke.modifiers;
+        if is_text_input(event.keystroke.key_char.as_deref(), modifiers.control) {
+            return false;
+        }
+        match (event.keystroke.key.as_ref(), modifiers.control) {
+            ("enter", _) => {
+                let found = self
+                    .prompt
+                    .search
+                    .as_ref()
+                    .and_then(|search| search.current(&self.prompt.history))
+                    .map(str::to_string);
+                if let Some(text) = found {
+                    self.prompt.buffer.set_text(&text);
+                }
+                self.prompt.search = None;
+            }
+            ("escape", _) | ("g", true) | ("c", true) => self.prompt.search = None,
+            ("backspace", _) => {
+                if let Some(search) = self.prompt.search.as_mut() {
+                    search.backspace(&self.prompt.history);
+                }
+            }
+            ("r", true) => {
+                if let Some(search) = self.prompt.search.as_mut() {
+                    search.older();
+                }
+            }
+            _ => {}
+        }
+        Self::consumed(cx)
+    }
+
+    /// Stops the key from reaching anything else, and redraws.
+    fn consumed(cx: &mut Context<Self>) -> bool {
+        cx.stop_propagation();
+        cx.notify();
+        true
+    }
+
+    /// Text typed into the editor, or into the search while it is open.
+    fn insert_typed(&mut self, text: &str) {
+        if let Some(search) = self.prompt.search.as_mut() {
+            for c in text.chars() {
+                search.type_char(&self.prompt.history, c);
+            }
+            return;
+        }
+        self.edit_buffer(|buffer| {
+            for c in text.chars() {
+                buffer.insert_char(c);
+            }
+        });
+    }
+
+    /// Runs an edit on the editor's buffer. Editing ends a walk through the
+    /// history, so the next Up starts again from the edited line.
+    fn edit_buffer(&mut self, edit: impl FnOnce(&mut Buffer)) {
+        self.prompt.walk.reset();
+        edit(&mut self.prompt.buffer);
+    }
+
+    /// Up or Down through the history, replacing the line with the entry.
+    fn recall(&mut self, older: bool) {
+        let entry = if older {
+            let current = self.prompt.buffer.text();
+            self.prompt.walk.older(&self.prompt.history, &current)
+        } else {
+            self.prompt.walk.newer(&self.prompt.history)
+        };
+        if let Some(entry) = entry {
+            self.prompt.buffer.set_text(&entry);
+        }
+    }
+
+    /// Sends the editor's line to the shell to run it. The line joins the history.
+    fn submit(&mut self) {
+        let bracketed = self.session.mode().contains(TermMode::BRACKETED_PASTE);
+        let text = self.prompt.buffer.take();
+        self.prompt.walk.reset();
+        self.prompt.history.push(&text);
+        self.send_input(&submit_bytes(&text, bracketed));
+    }
+
+    /// Moves the editor's cursor to a click on the editor. Returns false when the
+    /// click is not on the editor, so the pane handles it as before.
+    fn place_cursor(&mut self, line: usize, column: usize) -> bool {
+        if self.prompt.search.is_some() {
+            return false;
+        }
+        let Some((origin_line, origin_column)) = self.prompt.origin.get() else {
+            return false;
+        };
+        let Some(row) = line.checked_sub(origin_line) else {
+            return false;
+        };
+        let columns = self.metrics.get().columns;
+        let chars: Vec<char> = self.prompt.buffer.text().chars().collect();
+        let rows = wrap(&chars, columns.saturating_sub(origin_column), columns);
+        let Some(range) = rows.get(row) else {
+            return false;
+        };
+        let start = if row == 0 { origin_column } else { 0 };
+        let offset = column.saturating_sub(start).min(range.len());
+        self.prompt.buffer.set_cursor(range.start + offset);
+        true
+    }
+}
+
 impl Focusable for TerminalView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -1048,6 +1283,8 @@ impl Render for TerminalView {
                 bell: self.bell_on,
                 rows: self.layout.clone(),
                 selected: self.selected_block.get(),
+                editor: self.owns_input().then(|| self.prompt.draw()),
+                editor_origin: self.prompt.origin.clone(),
             })
             .children(find_bar)
     }

@@ -208,6 +208,34 @@ mod tests {
         reports_command_and_exit_status("fish");
     }
 
+    /// The editor's submit: once the shell is at its prompt, the line goes to the
+    /// PTY with its Enter, and the shell runs it. Without the text (only a bare
+    /// `\r`), no output appears and no block closes.
+    #[test]
+    fn zsh_runs_a_line_submitted_at_the_prompt() {
+        let Some(shell) = find_shell("zsh") else {
+            eprintln!("skipping: zsh is not installed");
+            return;
+        };
+        let session = Session::spawn_shell(&shell, 100, 24, None, |_| {}).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while session.input_mode() != crate::InputMode::Prompt {
+            assert!(Instant::now() < deadline, "zsh never reached its prompt");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        session.write(b"echo hi\r").unwrap();
+
+        loop {
+            if let Some(block) = session.blocks().iter().find(|b| b.exit_code.is_some()) {
+                assert_eq!(block.command.as_deref(), Some("echo hi"));
+                assert_eq!(session.block_output(block.id).as_deref(), Some("hi"));
+                break;
+            }
+            assert!(Instant::now() < deadline, "submitted line did not run");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Three commands with output. Scrolled into the first block's output it
     /// sticks its header to the top. Collapsed, its output takes no rows. (The
     /// frame fills from above at the end of the buffer, so the later blocks keep

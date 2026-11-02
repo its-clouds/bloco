@@ -8,6 +8,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::mode::InputMode;
 use crate::osc133::Mark;
 use crate::reflow::{Anchor, Layout};
 use crate::search::BufferPoint;
@@ -83,6 +84,8 @@ pub struct Blocks {
     prompt_line: Option<usize>,
     /// The directory the shell reported last (OSC 7).
     cwd: Option<PathBuf>,
+    /// Who owns the keyboard, from the marks seen so far.
+    input: InputMode,
 }
 
 impl Blocks {
@@ -91,6 +94,7 @@ impl Blocks {
     ///
     /// A `D` with no open block (the first prompt, for example) is ignored.
     pub fn apply(&mut self, mark: Mark, at: Option<BufferPoint>) {
+        self.input = self.input.after(&mark);
         match mark {
             Mark::PromptStart => self.prompt_line = at.map(|p| p.line),
             Mark::PromptEnd => {}
@@ -132,6 +136,12 @@ impl Blocks {
     /// Forgets where the blocks are. Used when the buffer no longer matches the
     /// recorded lines and they cannot be followed, which is when the scrollback
     /// counts were lost. The blocks stay, and their output is drawn as plain rows.
+    /// Who owns the keyboard, from the marks alone. The alternate screen is
+    /// not part of this; see [`InputMode::effective`].
+    pub fn input_mode(&self) -> InputMode {
+        self.input
+    }
+
     pub fn forget_positions(&mut self) {
         for line in self.lines_mut() {
             *line = None;

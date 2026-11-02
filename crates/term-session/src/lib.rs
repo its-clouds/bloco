@@ -6,6 +6,7 @@
 mod blocks;
 mod cwd;
 mod links;
+mod mode;
 mod osc133;
 mod reflow;
 mod search;
@@ -17,6 +18,7 @@ pub use alacritty_terminal::term::cell::Flags;
 pub use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor};
 pub use blocks::{Block, Blocks, Row};
 pub use links::Link;
+pub use mode::InputMode;
 pub use osc133::{parse_payload, Mark, Scanner};
 pub use search::{BufferPoint, FindMatch, FindQuery, FindResults, MAX_MATCHES};
 pub use session::{

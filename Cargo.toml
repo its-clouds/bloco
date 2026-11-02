@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/term-session", "crates/config", "crates/app"]
+members = ["crates/term-session", "crates/input-editor", "crates/config", "crates/app"]
 
 [workspace.package]
 license = "GPL-3.0-only"

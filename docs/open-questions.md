@@ -36,6 +36,11 @@ storing output per block fits its scrollback model.
 
 ## 3. Prompt rendering in the input editor
 
+> **Resolved (2026-11-02): the shell's own prompt (PS1).** The editor starts
+> after the shell's prompt, and keeps a local buffer until Enter. See
+> [ADR 0003](decisions/0003-input-editor-at-the-prompt.md). The options are kept
+> below for reference.
+
 When the editor owns the input, whose prompt is displayed?
 
 - Render the user's own `PS1` (powerlevel10k, starship…) above the editor.

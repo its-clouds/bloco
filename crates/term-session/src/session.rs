@@ -21,6 +21,7 @@ use std::ops::Range;
 use crate::blocks::{self, Block, Blocks, Row};
 use crate::cwd::pid_cwd;
 use crate::links;
+use crate::mode::InputMode;
 use crate::osc133::{Mark, Scanner};
 use crate::reflow::Layout;
 use crate::search::{self, BufferPoint, FindQuery, FindResults};
@@ -372,6 +373,16 @@ impl Session {
             state,
             _scripts: scripts,
         })
+    }
+
+    /// Who owns the keyboard now: the editor (`Prompt`), or the PTY. Full-screen
+    /// apps on the alternate screen count as `FullScreen`.
+    pub fn input_mode(&self) -> InputMode {
+        let state = self.state.lock().expect("state lock poisoned");
+        InputMode::effective(
+            state.blocks.input_mode(),
+            state.term.mode().contains(TermMode::ALT_SCREEN),
+        )
     }
 
     /// The shell's working directory. Uses the last OSC 7 report from the

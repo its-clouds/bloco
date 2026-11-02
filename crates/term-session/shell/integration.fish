@@ -1,7 +1,8 @@
 # term-session: OSC 133 semantic prompt marks and OSC 7 working directory for fish.
 #
 #   A  prompt is about to be drawn         (fish_prompt event)
-#   B  prompt is drawn, the user can type  (sent with A: fish has no hook after the prompt)
+#   B  not sent: fish has no hook after the prompt, so the mark would come before
+#      the prompt text. Without B the input editor stays off in fish (see mode.rs).
 #   C  command starts (payload: the line)  (fish_preexec event)
 #   D  command finished (payload: status) (fish_postexec event)
 #   7  working directory, as a file:// URI (fish_prompt event)
@@ -16,7 +17,7 @@ end
 
 function __term_session_prompt --on-event fish_prompt
     __term_session_report_cwd
-    printf '\033]133;A\007\033]133;B\007'
+    printf '\033]133;A\007'
 end
 
 function __term_session_postexec --on-event fish_postexec

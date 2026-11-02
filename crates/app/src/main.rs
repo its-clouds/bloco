@@ -5,6 +5,7 @@ mod block_header;
 mod colors;
 mod commands;
 mod find;
+mod prompt;
 mod keys;
 mod layout;
 mod mouse;

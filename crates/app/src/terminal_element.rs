@@ -9,7 +9,8 @@
 //! The layout follows `zed-industries/zed`, crates/terminal_view/src/terminal_element.rs
 //! (GPL-3.0-or-later). See NOTICE.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -20,11 +21,14 @@ use gpui::{
     StrikethroughStyle, TextAlign, TextRun, UnderlineStyle, Window, fill, outline, point, px,
     relative, size,
 };
-use term_session::{Block, CursorShape, FindMatch, Flags, Frame, Row, Session, Side, SnapshotCell};
+use term_session::{
+    Block, Cursor, CursorShape, FindMatch, Flags, Frame, Row, Session, Side, SnapshotCell,
+};
 
 use crate::block_header::header_text;
 use crate::colors::{Palette, dim};
 use crate::find::visible_spans;
+use crate::prompt::{self, EditorDraw};
 use crate::terminal_view::TerminalView;
 
 /// Space between the window edge and the grid, in pixels.
@@ -99,6 +103,10 @@ pub struct TerminalElement {
     pub rows: Rc<RefCell<Vec<Row>>>,
     /// The selected block, highlighted with its output.
     pub selected: Option<u64>,
+    /// The input editor to draw over the prompt, while the prompt owns the keys.
+    pub editor: Option<EditorDraw>,
+    /// Written on each frame: where the editor starts. See `PromptState::origin`.
+    pub editor_origin: Rc<Cell<Option<(usize, usize)>>>,
 }
 
 /// What `prepaint` decided to draw. `paint` only issues the draw calls.
@@ -212,6 +220,28 @@ impl Element for TerminalElement {
             cursor: None,
             ime_bounds: None,
         };
+
+        // The input editor is drawn from the shell's cursor, which sits where its
+        // prompt ends. The editor's own cursor replaces the shell's.
+        let mut cursor = cursor;
+        self.editor_origin.set(None);
+        if let Some(draw) = &self.editor {
+            if cursor.visible {
+                self.editor_origin.set(Some((cursor.line, cursor.column)));
+                let (line, column) = self.draw_editor(
+                    window,
+                    &mut prepaint,
+                    &metrics,
+                    draw,
+                    cursor,
+                    frame_columns,
+                    visual.len(),
+                );
+                cursor.line = line;
+                cursor.column = column;
+                cursor.shape = CursorShape::Beam;
+            }
+        }
 
         let cursor_on_screen = cursor.visible && cursor.line < visual.len();
         // The preedit covers the cells it is drawn over, so cell text there is skipped.
@@ -418,6 +448,84 @@ pub fn grid_size(area: Size<Pixels>, cell_width: Pixels, line_height: Pixels) ->
 }
 
 impl TerminalElement {
+    /// Draws the input editor from the shell's cursor, one screen row per visual
+    /// row, and returns where the editor's cursor is on screen.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_editor(
+        &self,
+        window: &mut Window,
+        out: &mut Prepaint,
+        metrics: &Metrics,
+        draw: &EditorDraw,
+        origin: Cursor,
+        columns: usize,
+        screen_rows: usize,
+    ) -> (usize, usize) {
+        let chars: Vec<char> = draw.text.chars().collect();
+        let rows = input_editor::wrap(&chars, columns.saturating_sub(origin.column), columns);
+        let (row, column) = input_editor::position(&rows, draw.cursor);
+        for (index, range) in rows.iter().enumerate() {
+            let line = origin.line + index;
+            if line >= screen_rows {
+                break;
+            }
+            let start = if index == 0 { origin.column } else { 0 };
+            self.draw_editor_row(window, out, metrics, draw, &chars, range.clone(), line, start);
+        }
+        let at = if row == 0 { origin.column + column } else { column };
+        (origin.line + row, at)
+    }
+
+    /// Shapes one screen row of the editor. Cells of one colour share a shaped
+    /// line. A wide character gets a line of its own.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_editor_row(
+        &self,
+        window: &mut Window,
+        out: &mut Prepaint,
+        metrics: &Metrics,
+        draw: &EditorDraw,
+        chars: &[char],
+        range: Range<usize>,
+        line: usize,
+        start: usize,
+    ) {
+        let mut column = start;
+        let mut batch: Option<Batch> = None;
+        for run in prompt::runs(&draw.spans, range) {
+            let fg = prompt::color(run.kind, &self.palette);
+            for &c in &chars[run.start..run.end] {
+                let width = char_width(c);
+                let joins = width == 1
+                    && batch
+                        .as_ref()
+                        .is_some_and(|b| b.glyph_width == 1 && b.style.fg == fg);
+                if !joins {
+                    flush(window, self, out, metrics, line, &mut batch);
+                    batch = Some(Batch {
+                        start: column,
+                        cells: 0,
+                        glyph_width: width,
+                        text: String::new(),
+                        style: RunStyle {
+                            fg,
+                            bold: false,
+                            italic: false,
+                            underline: None,
+                            strikethrough: false,
+                        },
+                    });
+                }
+                if let Some(b) = batch.as_mut() {
+                    b.text.push(c);
+                    b.cells += width;
+                }
+                column += width;
+            }
+        }
+        flush(window, self, out, metrics, line, &mut batch);
+    }
+
     /// Adds the backgrounds and text of one row to `out`.
     #[allow(clippy::too_many_arguments)]
     fn layout_line(
