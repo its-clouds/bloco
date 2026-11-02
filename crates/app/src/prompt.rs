@@ -10,9 +10,11 @@ use std::cell::Cell;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::Hsla;
-use input_editor::{Buffer, History, HistorySearch, Kind, Span, Walk, highlight};
+use input_editor::completion::{Item, Specs};
+use input_editor::{Buffer, History, HistorySearch, Kind, Span, Walk, highlight, position, wrap};
 use term_session::{Color, NamedColor};
 
 use crate::colors::Palette;
@@ -23,6 +25,44 @@ pub struct EditorDraw {
     pub text: String,
     pub spans: Vec<Span>,
     pub cursor: usize,
+}
+
+/// Rows the completion menu shows at once. The rest scroll with the selection.
+pub const MENU_ROWS: usize = 8;
+
+/// The completion menu under the editor: the candidates and the selected one.
+/// It is only open with two or more candidates. A single one is inserted.
+pub struct Menu {
+    /// The char index where the word being completed starts.
+    pub start: usize,
+    pub items: Vec<Item>,
+    pub selected: usize,
+}
+
+impl Menu {
+    pub fn new(start: usize, items: Vec<Item>) -> Self {
+        Self {
+            start,
+            items,
+            selected: 0,
+        }
+    }
+
+    /// Moves the selection down, and wraps from the last item to the first.
+    pub fn next(&mut self) {
+        self.selected = (self.selected + 1) % self.items.len();
+    }
+
+    /// Moves the selection up, and wraps from the first item to the last.
+    pub fn previous(&mut self) {
+        self.selected = (self.selected + self.items.len() - 1) % self.items.len();
+    }
+
+    /// The items on screen: a window of `MENU_ROWS` that holds the selection.
+    pub fn visible(&self) -> Range<usize> {
+        let first = (self.selected + 1).saturating_sub(MENU_ROWS);
+        first..(first + MENU_ROWS).min(self.items.len())
+    }
 }
 
 pub struct PromptState {
@@ -36,6 +76,10 @@ pub struct PromptState {
     /// in the last frame that drew the editor. `None` when it is not drawn.
     /// The element writes it, and the mouse handlers read it.
     pub origin: Rc<Cell<Option<(usize, usize)>>>,
+    /// The specs that answer Tab. See `completion.rs`.
+    pub specs: Arc<Specs>,
+    /// The completion menu, while it is open.
+    pub menu: Option<Menu>,
 }
 
 impl PromptState {
@@ -46,6 +90,8 @@ impl PromptState {
             walk: Walk::default(),
             search: None,
             origin: Rc::new(Cell::new(None)),
+            specs: Arc::new(input_editor::completion::builtin()),
+            menu: None,
         }
     }
 
@@ -115,6 +161,22 @@ pub fn color(kind: Option<Kind>, palette: &Palette) -> Hsla {
     }
 }
 
+/// The editor's cursor on screen, as (line, column). `origin` is where the
+/// editor starts (see [`PromptState::origin`]). The text wraps at `columns` the
+/// same way the element draws it.
+pub fn cursor_cell(
+    origin: (usize, usize),
+    text: &str,
+    cursor: usize,
+    columns: usize,
+) -> (usize, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let rows = wrap(&chars, columns.saturating_sub(origin.1), columns);
+    let (row, column) = position(&rows, cursor);
+    let at = if row == 0 { origin.1 + column } else { column };
+    (origin.0 + row, at)
+}
+
 /// Whether a key types text into the editor. Enter, Tab and Backspace also carry
 /// a `key_char` (GPUI sets `"\n"` for Enter), so a control character does not
 /// count. Cmd and Ctrl chords are shortcuts, not text.
@@ -169,6 +231,57 @@ fn history_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use input_editor::{Kind, highlight};
+
+    fn menu(count: usize) -> Menu {
+        let items = (0..count)
+            .map(|index| Item {
+                text: format!("item{index}"),
+                description: String::new(),
+            })
+            .collect();
+        Menu::new(0, items)
+    }
+
+    #[test]
+    fn menu_selection_wraps_both_ways() {
+        let mut menu = menu(3);
+        menu.next();
+        menu.next();
+        assert_eq!(menu.selected, 2);
+        menu.next();
+        assert_eq!(menu.selected, 0);
+        menu.previous();
+        assert_eq!(menu.selected, 2);
+    }
+
+    #[test]
+    fn menu_shows_a_window_that_holds_the_selection() {
+        let mut menu = menu(20);
+        assert_eq!(menu.visible(), 0..MENU_ROWS);
+        menu.selected = 12;
+        assert_eq!(menu.visible(), 5..13);
+        menu.selected = 19;
+        assert_eq!(menu.visible(), 12..20);
+    }
+
+    #[test]
+    fn menu_shows_every_item_when_they_fit() {
+        assert_eq!(menu(3).visible(), 0..3);
+    }
+
+    #[test]
+    fn cursor_cell_is_the_origin_plus_the_typed_text() {
+        assert_eq!(cursor_cell((5, 2), "abc", 3, 80), (5, 5));
+        assert_eq!(cursor_cell((5, 2), "abc", 1, 80), (5, 3));
+    }
+
+    #[test]
+    fn cursor_cell_wraps_onto_the_next_row() {
+        // The first row has 78 columns after the origin at column 2, so char 80
+        // is on the second row, at column 2 of the editor's rows.
+        let text = "x".repeat(90);
+        assert_eq!(cursor_cell((5, 2), &text, 80, 80), (6, 2));
+    }
 
     #[test]
     fn enter_tab_and_backspace_are_not_text() {

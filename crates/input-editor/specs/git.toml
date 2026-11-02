@@ -1,0 +1,487 @@
+# Completion spec for git. Options and subcommands of the commonly used parts
+# of git. Data only: the matcher reads it, nothing is run.
+name = "git"
+description = "Distributed version control"
+
+[[option]]
+name = "-C"
+description = "Run as if git was started in this directory"
+takes_value = true
+
+[[option]]
+name = "--no-pager"
+description = "Do not pipe output into a pager"
+
+[[option]]
+name = "--version"
+description = "Print the git version"
+
+[[subcommand]]
+name = "add"
+description = "Add file contents to the index"
+
+[[subcommand.option]]
+name = "-p"
+description = "Interactively choose hunks to stage"
+
+[[subcommand.option]]
+name = "-u"
+description = "Stage changes to tracked files only"
+
+[[subcommand.option]]
+name = "-A"
+description = "Stage all changes, including removals"
+
+[[subcommand.option]]
+name = "-N"
+description = "Record a file as intent-to-add"
+
+[[subcommand]]
+name = "bisect"
+description = "Find the commit that introduced a bug"
+
+[[subcommand]]
+name = "branch"
+description = "List, create or delete branches"
+
+[[subcommand.option]]
+name = "-a"
+description = "List local and remote branches"
+
+[[subcommand.option]]
+name = "-r"
+description = "List remote-tracking branches"
+
+[[subcommand.option]]
+name = "-d"
+description = "Delete a fully merged branch"
+takes_value = true
+
+[[subcommand.option]]
+name = "-D"
+description = "Force delete a branch"
+takes_value = true
+
+[[subcommand.option]]
+name = "-m"
+description = "Rename a branch"
+
+[[subcommand.option]]
+name = "-v"
+description = "Show the last commit of each branch"
+
+[[subcommand]]
+name = "checkout"
+description = "Switch branches or restore working tree files"
+
+[[subcommand.option]]
+name = "-b"
+description = "Create a branch and switch to it"
+takes_value = true
+
+[[subcommand.option]]
+name = "-B"
+description = "Create or reset a branch and switch to it"
+takes_value = true
+
+[[subcommand.option]]
+name = "-f"
+description = "Discard local changes when switching"
+
+[[subcommand.option]]
+name = "--track"
+description = "Set up tracking for a new branch"
+
+[[subcommand]]
+name = "cherry-pick"
+description = "Apply the changes of existing commits"
+
+[[subcommand.option]]
+name = "--continue"
+description = "Continue after resolving conflicts"
+
+[[subcommand.option]]
+name = "--abort"
+description = "Cancel the cherry-pick"
+
+[[subcommand.option]]
+name = "-n"
+description = "Apply the changes without committing"
+
+[[subcommand]]
+name = "clone"
+description = "Clone a repository into a new directory"
+
+[[subcommand.option]]
+name = "--depth"
+description = "Create a shallow clone with this many commits"
+takes_value = true
+
+[[subcommand.option]]
+name = "--recursive"
+description = "Also clone submodules"
+
+[[subcommand.option]]
+name = "-b"
+description = "Check out this branch instead of the default"
+takes_value = true
+
+[[subcommand]]
+name = "commit"
+description = "Record changes to the repository"
+
+[[subcommand.option]]
+name = "-m"
+description = "Use this message"
+takes_value = true
+
+[[subcommand.option]]
+name = "-a"
+description = "Stage all tracked changes before committing"
+
+[[subcommand.option]]
+name = "--amend"
+description = "Replace the last commit"
+
+[[subcommand.option]]
+name = "--no-edit"
+description = "Keep the message when amending"
+
+[[subcommand.option]]
+name = "-v"
+description = "Show the diff in the commit message editor"
+
+[[subcommand.option]]
+name = "--allow-empty"
+description = "Allow a commit with no changes"
+
+[[subcommand]]
+name = "diff"
+description = "Show changes between commits, the index and the tree"
+
+[[subcommand.option]]
+name = "--staged"
+description = "Show the staged changes"
+
+[[subcommand.option]]
+name = "--cached"
+description = "Show the staged changes"
+
+[[subcommand.option]]
+name = "--stat"
+description = "Show a diffstat instead of the patch"
+
+[[subcommand.option]]
+name = "--name-only"
+description = "Show only the names of changed files"
+
+[[subcommand]]
+name = "fetch"
+description = "Download objects and refs from a remote"
+
+[[subcommand.option]]
+name = "--all"
+description = "Fetch all remotes"
+
+[[subcommand.option]]
+name = "--prune"
+description = "Remove remote-tracking branches that no longer exist"
+
+[[subcommand.option]]
+name = "--tags"
+description = "Fetch all tags"
+
+[[subcommand]]
+name = "log"
+description = "Show the commit history"
+
+[[subcommand.option]]
+name = "--oneline"
+description = "One line per commit"
+
+[[subcommand.option]]
+name = "--graph"
+description = "Draw the commit graph"
+
+[[subcommand.option]]
+name = "--all"
+description = "Show all branches"
+
+[[subcommand.option]]
+name = "-n"
+description = "Show only this many commits"
+takes_value = true
+
+[[subcommand.option]]
+name = "-p"
+description = "Show the patch of each commit"
+
+[[subcommand]]
+name = "merge"
+description = "Join two or more development histories"
+
+[[subcommand.option]]
+name = "--no-ff"
+description = "Create a merge commit even when fast-forward is possible"
+
+[[subcommand.option]]
+name = "--squash"
+description = "Stage the merged changes without committing"
+
+[[subcommand.option]]
+name = "--abort"
+description = "Abort the current merge"
+
+[[subcommand.option]]
+name = "--continue"
+description = "Continue after resolving conflicts"
+
+[[subcommand]]
+name = "pull"
+description = "Fetch from and integrate with another repository"
+
+[[subcommand.option]]
+name = "--rebase"
+description = "Rebase the current branch on top of the upstream"
+
+[[subcommand.option]]
+name = "--ff-only"
+description = "Refuse to merge unless fast-forward"
+
+[[subcommand.option]]
+name = "--prune"
+description = "Remove stale remote-tracking branches"
+
+[[subcommand]]
+name = "push"
+description = "Update remote refs along with associated objects"
+
+[[subcommand.option]]
+name = "-u"
+description = "Set the upstream for the branch"
+
+[[subcommand.option]]
+name = "--force-with-lease"
+description = "Force push unless the remote changed"
+
+[[subcommand.option]]
+name = "--force"
+description = "Force push, overwriting the remote branch"
+
+[[subcommand.option]]
+name = "--tags"
+description = "Push all tags"
+
+[[subcommand.option]]
+name = "--delete"
+description = "Delete a remote branch"
+
+[[subcommand.option]]
+name = "--dry-run"
+description = "Show what would be pushed"
+
+[[subcommand]]
+name = "rebase"
+description = "Reapply commits on top of another base"
+
+[[subcommand.option]]
+name = "-i"
+description = "Rebase interactively"
+
+[[subcommand.option]]
+name = "--continue"
+description = "Continue after resolving conflicts"
+
+[[subcommand.option]]
+name = "--abort"
+description = "Abort the rebase"
+
+[[subcommand.option]]
+name = "--skip"
+description = "Skip the current commit"
+
+[[subcommand.option]]
+name = "--onto"
+description = "Rebase onto this commit"
+takes_value = true
+
+[[subcommand]]
+name = "reset"
+description = "Reset the current branch to a commit"
+
+[[subcommand.option]]
+name = "--soft"
+description = "Keep the index and the working tree"
+
+[[subcommand.option]]
+name = "--mixed"
+description = "Reset the index, keep the working tree"
+
+[[subcommand.option]]
+name = "--hard"
+description = "Reset the index and the working tree"
+
+[[subcommand]]
+name = "restore"
+description = "Restore working tree files"
+
+[[subcommand.option]]
+name = "--staged"
+description = "Restore the index"
+
+[[subcommand.option]]
+name = "--source"
+description = "Restore from this tree"
+takes_value = true
+
+[[subcommand]]
+name = "revert"
+description = "Revert existing commits"
+
+[[subcommand.option]]
+name = "--no-edit"
+description = "Use the default message"
+
+[[subcommand.option]]
+name = "--continue"
+description = "Continue after resolving conflicts"
+
+[[subcommand.option]]
+name = "--abort"
+description = "Cancel the revert"
+
+[[subcommand]]
+name = "stash"
+description = "Stash the changes in a dirty working directory"
+
+[[subcommand.option]]
+name = "-u"
+description = "Include untracked files"
+
+[[subcommand.option]]
+name = "-k"
+description = "Keep the index when stashing"
+
+[[subcommand.subcommand]]
+name = "push"
+description = "Save changes to a new stash entry"
+
+[[subcommand.subcommand]]
+name = "pop"
+description = "Apply the latest stash and remove it"
+
+[[subcommand.subcommand]]
+name = "apply"
+description = "Apply the latest stash and keep it"
+
+[[subcommand.subcommand]]
+name = "list"
+description = "List stash entries"
+
+[[subcommand.subcommand]]
+name = "drop"
+description = "Remove a stash entry"
+
+[[subcommand.subcommand]]
+name = "show"
+description = "Show the changes in a stash entry"
+
+[[subcommand]]
+name = "status"
+description = "Show the working tree status"
+
+[[subcommand.option]]
+name = "-s"
+description = "Short format"
+
+[[subcommand.option]]
+name = "-b"
+description = "Show the branch and tracking info"
+
+[[subcommand.option]]
+name = "--ignored"
+description = "Show ignored files too"
+
+[[subcommand]]
+name = "switch"
+description = "Switch branches"
+
+[[subcommand.option]]
+name = "-c"
+description = "Create a branch and switch to it"
+takes_value = true
+
+[[subcommand.option]]
+name = "-C"
+description = "Create or reset a branch and switch to it"
+takes_value = true
+
+[[subcommand.option]]
+name = "-"
+description = "Switch to the previous branch"
+
+[[subcommand]]
+name = "tag"
+description = "Create, list, delete or verify tags"
+
+[[subcommand.option]]
+name = "-a"
+description = "Create an annotated tag"
+
+[[subcommand.option]]
+name = "-m"
+description = "Use this message for an annotated tag"
+takes_value = true
+
+[[subcommand.option]]
+name = "-d"
+description = "Delete a tag"
+takes_value = true
+
+[[subcommand]]
+name = "remote"
+description = "Manage the set of tracked repositories"
+
+[[subcommand.subcommand]]
+name = "add"
+description = "Add a remote"
+
+[[subcommand.subcommand]]
+name = "remove"
+description = "Remove a remote"
+
+[[subcommand.subcommand]]
+name = "rename"
+description = "Rename a remote"
+
+[[subcommand.subcommand]]
+name = "show"
+description = "Show information about a remote"
+
+[[subcommand.subcommand]]
+name = "set-url"
+description = "Change the URL of a remote"
+
+[[subcommand]]
+name = "show"
+description = "Show various types of objects"
+
+[[subcommand]]
+name = "init"
+description = "Create an empty repository"
+
+[[subcommand]]
+name = "config"
+description = "Get and set repository or global options"
+
+[[subcommand.option]]
+name = "--global"
+description = "Use the global config file"
+
+[[subcommand.option]]
+name = "--list"
+description = "List all settings"
+
+[[subcommand]]
+name = "help"
+description = "Show help for a command"

@@ -92,9 +92,14 @@ the week of use.
 
 ## M5 — Completions
 
+Status: built, and the build and tests pass. The window checks passed on
+2026-11-02; see [m5-checklist.md](m5-checklist.md). The format and fallback are accepted in
+[open question 4](open-questions.md#4-completion-spec-format-and-source).
+
 - Completion menu with spec files and the shell's own completions as fallback
   ([open question 4](open-questions.md#4-completion-spec-format-and-source)).
 - Start with specs for the commands you use most (git, docker, kubectl, cargo, npm).
+- Tab opens the menu, Tab and arrows move, Enter accepts, Escape closes.
 
 ## M6 — Sidebars, settings UI, themes
 

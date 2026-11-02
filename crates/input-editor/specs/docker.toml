@@ -1,0 +1,321 @@
+# Completion spec for docker. The commonly used management commands and the
+# top-level commands. Data only.
+name = "docker"
+description = "Build, run and manage containers"
+
+[[option]]
+name = "-H"
+description = "Daemon socket to connect to"
+takes_value = true
+
+[[option]]
+name = "--context"
+description = "Name of the context to use"
+takes_value = true
+
+[[option]]
+name = "--help"
+description = "Print usage"
+
+[[subcommand]]
+name = "build"
+description = "Build an image from a Dockerfile"
+
+[[subcommand.option]]
+name = "-t"
+description = "Tag the image (name:tag)"
+takes_value = true
+
+[[subcommand.option]]
+name = "-f"
+description = "Path to the Dockerfile"
+takes_value = true
+
+[[subcommand.option]]
+name = "--no-cache"
+description = "Do not use the build cache"
+
+[[subcommand.option]]
+name = "--platform"
+description = "Target platform, such as linux/amd64"
+takes_value = true
+
+[[subcommand]]
+name = "compose"
+description = "Define and run multi-container applications"
+
+[[subcommand.option]]
+name = "-f"
+description = "Compose file to use"
+takes_value = true
+
+[[subcommand.option]]
+name = "-p"
+description = "Project name"
+takes_value = true
+
+[[subcommand.subcommand]]
+name = "up"
+description = "Create and start the services"
+
+[[subcommand.subcommand]]
+name = "down"
+description = "Stop and remove the services"
+
+[[subcommand.subcommand]]
+name = "build"
+description = "Build or rebuild the services"
+
+[[subcommand.subcommand]]
+name = "logs"
+description = "View the logs of the services"
+
+[[subcommand.subcommand]]
+name = "ps"
+description = "List the services"
+
+[[subcommand.subcommand]]
+name = "exec"
+description = "Run a command in a running service"
+
+[[subcommand.subcommand]]
+name = "restart"
+description = "Restart the services"
+
+[[subcommand.subcommand]]
+name = "pull"
+description = "Pull the images of the services"
+
+[[subcommand]]
+name = "container"
+description = "Manage containers"
+
+[[subcommand.subcommand]]
+name = "ls"
+description = "List containers"
+
+[[subcommand.subcommand]]
+name = "run"
+description = "Create and run a container from an image"
+
+[[subcommand.subcommand]]
+name = "exec"
+description = "Run a command in a running container"
+
+[[subcommand.subcommand]]
+name = "stop"
+description = "Stop running containers"
+
+[[subcommand.subcommand]]
+name = "rm"
+description = "Remove containers"
+
+[[subcommand.subcommand]]
+name = "logs"
+description = "Fetch the logs of a container"
+
+[[subcommand]]
+name = "image"
+description = "Manage images"
+
+[[subcommand.subcommand]]
+name = "ls"
+description = "List images"
+
+[[subcommand.subcommand]]
+name = "pull"
+description = "Download an image"
+
+[[subcommand.subcommand]]
+name = "push"
+description = "Upload an image"
+
+[[subcommand.subcommand]]
+name = "rm"
+description = "Remove images"
+
+[[subcommand.subcommand]]
+name = "build"
+description = "Build an image from a Dockerfile"
+
+[[subcommand]]
+name = "network"
+description = "Manage networks"
+
+[[subcommand.subcommand]]
+name = "ls"
+description = "List networks"
+
+[[subcommand.subcommand]]
+name = "create"
+description = "Create a network"
+
+[[subcommand.subcommand]]
+name = "rm"
+description = "Remove networks"
+
+[[subcommand]]
+name = "volume"
+description = "Manage volumes"
+
+[[subcommand.subcommand]]
+name = "ls"
+description = "List volumes"
+
+[[subcommand.subcommand]]
+name = "create"
+description = "Create a volume"
+
+[[subcommand.subcommand]]
+name = "rm"
+description = "Remove volumes"
+
+[[subcommand]]
+name = "run"
+description = "Create and run a container from an image"
+
+[[subcommand.option]]
+name = "-d"
+description = "Run in the background"
+
+[[subcommand.option]]
+name = "-it"
+description = "Keep STDIN open and allocate a terminal"
+
+[[subcommand.option]]
+name = "-p"
+description = "Publish a port (host:container)"
+takes_value = true
+
+[[subcommand.option]]
+name = "-v"
+description = "Bind mount a volume"
+takes_value = true
+
+[[subcommand.option]]
+name = "-e"
+description = "Set an environment variable"
+takes_value = true
+
+[[subcommand.option]]
+name = "--rm"
+description = "Remove the container when it exits"
+
+[[subcommand.option]]
+name = "--name"
+description = "Name the container"
+takes_value = true
+
+[[subcommand.option]]
+name = "--network"
+description = "Connect to this network"
+takes_value = true
+
+[[subcommand]]
+name = "exec"
+description = "Run a command in a running container"
+
+[[subcommand.option]]
+name = "-it"
+description = "Keep STDIN open and allocate a terminal"
+
+[[subcommand.option]]
+name = "-u"
+description = "Run as this user"
+takes_value = true
+
+[[subcommand]]
+name = "ps"
+description = "List containers"
+
+[[subcommand.option]]
+name = "-a"
+description = "Show all containers, not only running ones"
+
+[[subcommand.option]]
+name = "-q"
+description = "Show only container IDs"
+
+[[subcommand]]
+name = "images"
+description = "List images"
+
+[[subcommand.option]]
+name = "-a"
+description = "Show intermediate images too"
+
+[[subcommand.option]]
+name = "-q"
+description = "Show only image IDs"
+
+[[subcommand]]
+name = "pull"
+description = "Download an image from a registry"
+
+[[subcommand]]
+name = "push"
+description = "Upload an image to a registry"
+
+[[subcommand]]
+name = "stop"
+description = "Stop running containers"
+
+[[subcommand]]
+name = "start"
+description = "Start stopped containers"
+
+[[subcommand]]
+name = "restart"
+description = "Restart containers"
+
+[[subcommand]]
+name = "rm"
+description = "Remove containers"
+
+[[subcommand.option]]
+name = "-f"
+description = "Force the removal of a running container"
+
+[[subcommand]]
+name = "rmi"
+description = "Remove images"
+
+[[subcommand]]
+name = "logs"
+description = "Fetch the logs of a container"
+
+[[subcommand.option]]
+name = "-f"
+description = "Follow the log output"
+
+[[subcommand]]
+name = "inspect"
+description = "Return low-level information on objects"
+
+[[subcommand]]
+name = "system"
+description = "Manage Docker"
+
+[[subcommand.subcommand]]
+name = "prune"
+description = "Remove unused data"
+
+[[subcommand.subcommand]]
+name = "df"
+description = "Show Docker disk usage"
+
+[[subcommand]]
+name = "login"
+description = "Log in to a registry"
+
+[[subcommand]]
+name = "logout"
+description = "Log out from a registry"
+
+[[subcommand]]
+name = "version"
+description = "Show the Docker version"
+
+[[subcommand]]
+name = "info"
+description = "Display system-wide information"

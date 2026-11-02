@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 license.workspace = true
 publish.workspace = true
-description = "The prompt input editor of Bloco: text buffer, undo, history and highlighting. No UI code."
+description = "The prompt input editor of Bloco: text buffer, undo, history, highlighting and completion. No UI code."
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
