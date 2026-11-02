@@ -7,6 +7,7 @@ mod blocks;
 mod cwd;
 mod links;
 mod osc133;
+mod reflow;
 mod search;
 mod session;
 mod shell;

@@ -75,10 +75,22 @@ Status as of this change:
 | 31 | Shell with no integration | Run `sh` in a pane. It shows plain output with no headers, and nothing breaks | Checked (author, in the window) |
 | 32 | Headers after a full scrollback | `seq 1 12000`, then `seq 1 20`, then `echo hi`. Each command still shows its header and its output is right. Cmd+↑ reaches the `seq 1 20` block | Checked (author, in the window). The `seq 1 12000` block itself is not reachable: its header left the scrollback (see Known limitations) |
 
+## Resize and full screen
+
+| # | Check | How to check | Status |
+| --- | --- | --- | --- |
+| 33 | Resize and fullscreen keep blocks | Run `ls`, then a command longer than the pane, then `seq 1 60`. Drag the window narrower, wider and shorter, then go fullscreen and back. Every header stays, Cmd+↑ and Cmd+↓ still move between the blocks, and Cmd+Shift+C copies the command of the selected block. Run `vim` and change its height while it runs: the blocks come back after `:q`. A width change while `vim` runs is covered by the known limitation below | Checked (author, in the window) |
+
 ## Known limitations
 
-- **Resizing the width forgets the block positions.** A width change rewraps the
-  buffer, so the blocks show as plain rows from then on. New commands get headers.
+- **A width change while a full-screen app runs forgets the block positions.** The
+  primary screen cannot be read while the alternate screen is active, so its rewrapped
+  lines cannot be followed. The blocks show as plain rows from then on. A height change
+  keeps them.
+- **The shell redraws a wrapped prompt on resize.** Readline redraws the prompt
+  when the window changes size. A prompt that wraps at the new width can overwrite the
+  rows above it. The overwritten text is gone from the buffer, so that block's output
+  shows the redrawn prompt. This is the shell's output, not a block position.
 - **Full scrollback is counted, not exact.** Past 10,000 lines, the lines that leave the
   top are counted through the view offset (see `Scrollback` in
   `crates/term-session/src/session.rs`). A scroll region on the primary screen can add to

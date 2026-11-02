@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::osc133::Mark;
+use crate::reflow::{Anchor, Layout};
 use crate::search::BufferPoint;
 
 /// Most blocks kept. The oldest go first, and their headers with them.
@@ -129,15 +130,41 @@ impl Blocks {
     }
 
     /// Forgets where the blocks are. Used when the buffer no longer matches the
-    /// recorded lines: the scrollback is full, or a width change rewrapped it.
-    /// The blocks stay, and their output is drawn as plain rows.
+    /// recorded lines and they cannot be followed, which is when the scrollback
+    /// counts were lost. The blocks stay, and their output is drawn as plain rows.
     pub fn forget_positions(&mut self) {
-        self.prompt_line = None;
-        for block in &mut self.list {
-            block.prompt_line = None;
-            block.output_line = None;
-            block.end_line = None;
+        for line in self.lines_mut() {
+            *line = None;
         }
+    }
+
+    /// Takes every recorded line as an anchor in `layout`, before the grid is
+    /// resized. [`Blocks::restore`] puts them back after the resize.
+    pub(crate) fn anchors(&mut self, layout: &Layout) -> Vec<Option<Anchor>> {
+        self.lines_mut()
+            .into_iter()
+            .map(|line| (*line).and_then(|line| layout.anchor(line)))
+            .collect()
+    }
+
+    /// Puts each line back where its anchor is in `layout`, the grid after the
+    /// resize. A line whose text left the buffer loses its position.
+    pub(crate) fn restore(&mut self, anchors: &[Option<Anchor>], layout: &Layout) {
+        for (line, anchor) in self.lines_mut().into_iter().zip(anchors.iter().copied()) {
+            *line = anchor.and_then(|anchor| layout.line(anchor));
+        }
+    }
+
+    /// Every recorded line, in one fixed order: the pending prompt line, then the
+    /// prompt, output and end lines of each block.
+    fn lines_mut(&mut self) -> Vec<&mut Option<usize>> {
+        let mut lines = vec![&mut self.prompt_line];
+        for block in &mut self.list {
+            lines.push(&mut block.prompt_line);
+            lines.push(&mut block.output_line);
+            lines.push(&mut block.end_line);
+        }
+        lines
     }
 
     /// Moves every recorded line up by `lines`, for lines dropped from the top
