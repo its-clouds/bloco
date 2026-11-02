@@ -18,9 +18,10 @@ use gpui::{
     IntoElement, LayoutId, Pixels, Point, ShapedLine, SharedString, Style, StrikethroughStyle,
     TextAlign, TextRun, UnderlineStyle, Window, fill, outline, point, px, relative, size,
 };
-use term_session::{CursorShape, Flags, Session, Side, SnapshotCell};
+use term_session::{CursorShape, FindMatch, Flags, Session, Side, SnapshotCell};
 
 use crate::colors::{Palette, dim};
+use crate::find::visible_spans;
 use crate::terminal_view::TerminalView;
 
 /// Space between the window edge and the grid, in pixels.
@@ -82,6 +83,8 @@ pub struct TerminalElement {
     pub marked_text: Option<String>,
     /// A URL under the mouse with Cmd held: (line, first column, last column).
     pub hovered_link: Option<(usize, usize, usize)>,
+    /// Find matches to highlight (oldest first), and the index of the current one.
+    pub find: Option<(Rc<[FindMatch]>, Option<usize>)>,
 }
 
 /// What `prepaint` decided to draw. `paint` only issues the draw calls.
@@ -205,6 +208,16 @@ impl Element for TerminalElement {
             _ => None,
         };
         let block_cursor = self.focused && cursor_on_screen && cursor.shape == CursorShape::Block;
+        let found = match &self.find {
+            Some((matches, current)) => visible_spans(
+                matches,
+                *current,
+                snapshot.top_line,
+                snapshot.rows,
+                snapshot.columns,
+            ),
+            None => vec![Vec::new(); snapshot.rows],
+        };
 
         for line in 0..snapshot.rows {
             self.layout_line(
@@ -216,6 +229,7 @@ impl Element for TerminalElement {
                 |column| {
                     block_cursor && line == cursor.line && column == cursor.column
                 },
+                &found[line],
                 preedit_cover,
             );
         }
@@ -355,6 +369,7 @@ impl TerminalElement {
         row: &[SnapshotCell],
         line: usize,
         is_block_cursor: impl Fn(usize) -> bool,
+        found: &[(usize, usize, bool)],
         preedit_cover: Option<(usize, usize, usize)>,
     ) {
         let default_bg = self.palette.background;
@@ -362,7 +377,11 @@ impl TerminalElement {
         let mut batch: Option<Batch> = None;
 
         for (column, cell) in row.iter().enumerate() {
-            let (fg, bg) = resolve(cell, &self.palette, is_block_cursor(column));
+            let found_here = found
+                .iter()
+                .find(|(first, last, _)| (*first..=*last).contains(&column))
+                .map(|&(_, _, current)| current);
+            let (fg, bg) = resolve(cell, &self.palette, found_here, is_block_cursor(column));
 
             // Background runs: consecutive cells with the same color become one rectangle.
             match bg_run {
@@ -508,9 +527,15 @@ fn push_char(batch: &mut Batch, cell: &SnapshotCell) {
     }
 }
 
-/// Foreground and background of a cell after inverse, dim, hidden, selection
-/// and the block cursor are applied.
-fn resolve(cell: &SnapshotCell, palette: &Palette, block_cursor: bool) -> (Hsla, Hsla) {
+/// Foreground and background of a cell after inverse, dim, hidden, selection,
+/// find matches and the block cursor are applied. `found` is `Some(is_current)`
+/// for a cell inside a find match.
+fn resolve(
+    cell: &SnapshotCell,
+    palette: &Palette,
+    found: Option<bool>,
+    block_cursor: bool,
+) -> (Hsla, Hsla) {
     let mut fg = palette.resolve(cell.fg);
     let mut bg = palette.resolve(cell.bg);
     if cell.flags.contains(Flags::INVERSE) {
@@ -524,6 +549,10 @@ fn resolve(cell: &SnapshotCell, palette: &Palette, block_cursor: bool) -> (Hsla,
     }
     if cell.selected {
         bg = palette.selection;
+    }
+    if let Some(current) = found {
+        bg = if current { palette.find_current } else { palette.find_match };
+        fg = palette.find_text;
     }
     if block_cursor {
         bg = palette.cursor;

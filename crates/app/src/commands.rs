@@ -28,6 +28,10 @@ actions!(
         TextLineEnd,
         TextDeleteWordBack,
         TextDeleteToLineStart,
+        FindOpen,
+        FindNext,
+        FindPrevious,
+        FindClose,
         QuitApp,
     ]
 );
@@ -73,6 +77,10 @@ pub const COMMANDS: &[Command] = &[
     Command { id: "terminal.line_end", title: "Move to end of line", keys: &["cmd-right"] },
     Command { id: "terminal.delete_word_back", title: "Delete word backward", keys: &["alt-backspace"] },
     Command { id: "terminal.delete_to_line_start", title: "Delete to start of line", keys: &["cmd-backspace"] },
+    Command { id: "find.open", title: "Find", keys: &["cmd-f"] },
+    Command { id: "find.next", title: "Find next", keys: &["cmd-g"] },
+    Command { id: "find.previous", title: "Find previous", keys: &["cmd-shift-g"] },
+    Command { id: "find.close", title: "Close find bar", keys: &[] },
     Command { id: "app.quit", title: "Quit Bloco", keys: &["cmd-q"] },
 ];
 
@@ -99,6 +107,10 @@ pub fn action_for(id: &str) -> Option<Box<dyn Action>> {
         "terminal.line_end" => Box::new(TextLineEnd),
         "terminal.delete_word_back" => Box::new(TextDeleteWordBack),
         "terminal.delete_to_line_start" => Box::new(TextDeleteToLineStart),
+        "find.open" => Box::new(FindOpen),
+        "find.next" => Box::new(FindNext),
+        "find.previous" => Box::new(FindPrevious),
+        "find.close" => Box::new(FindClose),
         "app.quit" => Box::new(QuitApp),
         _ => {
             let number: usize = id.strip_prefix("tab.select.")?.parse().ok()?;

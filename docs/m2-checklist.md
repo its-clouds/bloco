@@ -23,7 +23,7 @@ manual run.
 Status as of this change:
 
 - Build and tests: `cargo build --release` and `cargo test --workspace` pass
-  (config 19, term-session 19, app 32 tests).
+  (config 19, term-session 30, app 40 tests).
 - Launch: the binary and the `.app` bundle start, each with its zsh child, and stay
   up. Killing the shell closes the app.
 - Hot reload: a valid file applies, and an invalid file is logged and keeps the last
@@ -151,18 +151,50 @@ The keys send readline bytes at a shell prompt and xterm keys in full-screen app
 | 62 | A key can be removed in `keymap.toml` | Add `[[bind]]` with `keys = "cmd-left"` and `action = "none"`. Cmd+← sends nothing, and the palette shows no shortcut for "Move to start of line" | Pending |
 | 63 | Cmd+Opt+arrows still move focus, and the shell gets no keys | In a split, Cmd+Opt+← moves focus to the left pane. `cat -v` in that pane prints nothing | Pending |
 
+## Find bar
+
+Unit tests cover the search (plain text, case, regex, invalid regex, wrapped lines,
+scrollback, the match limit) and the bar's state (typing, counter, next and previous,
+keeping the current match). Everything you see or type is pending.
+
+| # | Check | How to check | Status |
+| --- | --- | --- | --- |
+| 64 | Search logic | `cargo test -p term-session search` and `cargo test -p app find` pass | Checked |
+| 65 | Cmd+F opens the bar | Press Cmd+F. A bar appears at the top right of the focused pane with the cursor in its input. Typing goes to the bar, not the shell | Pending |
+| 66 | Search as you type, highlights | Run `ls -la /`, then Cmd+F and type `x`. Every `x` is yellow, and the newest one (lowest on screen) is orange. The counter reads `1/N` | Pending |
+| 67 | Next and previous | Enter and Cmd+G move the orange match up to older output (`2/N`, `3/N`, …). Shift+Enter and Cmd+Shift+G move it back down. The ↓ and ↑ buttons do the same. At the end it wraps around | Pending |
+| 68 | A match in the scrollback scrolls into view | Run `seq 1 5000`, Cmd+F, type `4242`. The view jumps up to `4242` and centers it | Pending |
+| 69 | Regex and case toggles | Click `.*` and `Aa` (each one highlights when on). `Aa` on: `X` no longer matches `x`. `.*` off: `a.c` matches only the literal `a.c` | Pending |
+| 70 | Invalid regex | `.*` on, type `(`. The border and the counter turn red with "Invalid regex", and nothing crashes. Type `)`: results come back | Pending |
+| 71 | No results | Type `zzzqqq`. The counter reads "No results" and nothing is highlighted | Pending |
+| 72 | Selection pre-fills the query | Select a word with a double-click, then Cmd+F. The word is in the input and highlighted in the output | Pending |
+| 73 | Cmd+F on an open bar selects the query | With text in the bar, press Cmd+F (or Cmd+A). The query is highlighted. Typing replaces it, Backspace clears it | Pending |
+| 74 | Esc and × close the bar | Press Esc: the bar and the highlights go, the keyboard is back in the shell, and the view stays on the last match. Open it again and close it with × | Pending |
+| 75 | Reopen offers the last query | Close the bar, then Cmd+F with no selection. The last query is there, selected | Pending |
+| 76 | Results follow new output | Cmd+F, type `tick`, click the terminal and run `for i in {1..20}; do echo tick; sleep 0.2; done`. The counter grows while it runs and the current match stays put | Pending |
+| 77 | Per-pane state | Split with Cmd+D. Search `foo` in one pane and `bar` in the other. Each pane keeps its own bar, query and highlights | Pending |
+| 78 | Keys in the bar never reach the shell | In the bar, press Option+Backspace (deletes a word of the query), Cmd+Backspace (clears it), Ctrl+C, the arrows and Cmd+V (pastes into the query). The shell gets nothing | Pending |
+| 79 | Palette and keymap | The palette lists "Find", "Find next", "Find previous" and "Close find bar". In `keymap.toml`, bind `cmd-shift-f` to `find.open`: it opens the bar | Pending |
+| 80 | Light theme | `theme = "light"`: the matches are light yellow and orange, and the text on them is readable | Pending |
+| 81 | Big scrollback | Run `seq 1 200000`, then search `1`. Typing stays responsive. The counter shows `1/10000+` | Pending |
+
 ## Known issues
 
 - **Keyboard and screen checks are not run.** macOS denied keystroke injection to this
-  session (error 1002). Rows 8, 11, 16 to 17, 18 to 39, 41 to 45, 46 to 53 and 54 to 63
-  need a manual run.
+  session (error 1002). Rows 8, 11, 16 to 17, 18 to 39, 41 to 45, 46 to 53, 54 to 63
+  and 65 to 81 need a manual run.
 - **Command-line keys assume an emacs keymap.** In a shell's vi mode, the same bytes
   do something else.
 - **Left and right Option** are told apart with the keyboard device flags
   (`CGEventSourceFlagsState`). This has not been checked on a real keyboard.
 - **Cmd+W closes the focused pane**, and the tab when it is the last pane. The palette's
   "Close tab" closes all panes of the tab.
-- **The palette takes typed text only.** IME composition does not reach it.
+- **The palette and the find bar take typed text only.** IME composition does not reach
+  them. The find input has no movable cursor: you type and delete at the end.
+- **Find keeps at most 10,000 matches**, the newest ones. The counter then ends in `+`.
+- **Find highlights can lag new output** by up to 150 ms (the search reruns at most
+  that often). When the scrollback is full, old highlights shift by a line per new line
+  until the rerun.
 - **The tab bar is always shown**, even with one tab.
 - **Config reload polls** the two files every half second.
 - **Directory tracking** needs OSC 7 (the zsh integration sends it). Other shells use the

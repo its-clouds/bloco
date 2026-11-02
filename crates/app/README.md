@@ -13,7 +13,8 @@ dependency.
 | `split_tree.rs` | Pane layout as a binary tree of splits: geometry, neighbors, removal, ratios (no GPUI, unit tests) |
 | `commands.rs` | The action registry: ids, titles, default keys, and the GPUI keybindings built from them |
 | `palette.rs` | Command palette state, fuzzy filter, shortcut text (unit tests) |
-| `terminal_view.rs` | One pane: keyboard, mouse, clipboard, scrollback, IME, Option as Meta. Emits `TerminalEvent`s to the workspace |
+| `terminal_view.rs` | One pane: keyboard, mouse, clipboard, scrollback, IME, Option as Meta, and its find bar. Emits `TerminalEvent`s to the workspace |
+| `find.rs` | Find bar state: query, toggles, matches, current match, counter, highlighted cells (unit tests) |
 | `terminal_element.rs` | Draws the grid: cell metrics, resize to the window, background runs, text runs, cursor |
 | `keys.rs` | Keystroke to escape sequence mapping (adapted from Zed), and the command-line text edits (`TextEdit`) |
 | `mouse.rs` | Mouse and wheel report encoding (adapted from Zed) |
@@ -38,6 +39,9 @@ These are the defaults. `keymap.toml` can change any of them (see below).
 | Move back / forward one word (command line) | Option+← / Option+→ | `terminal.word_back`, `terminal.word_forward` |
 | Move to start / end of line (command line) | Cmd+← / Cmd+→ | `terminal.line_start`, `terminal.line_end` |
 | Delete word backward / delete to start of line | Option+Backspace / Cmd+Backspace | `terminal.delete_word_back`, `terminal.delete_to_line_start` |
+| Find (opens the bar, or selects its query when open) | Cmd+F | `find.open` |
+| Next match (older) / previous match (newer) | Cmd+G / Cmd+Shift+G, or Enter / Shift+Enter in the bar | `find.next`, `find.previous` |
+| Close the find bar | Esc in the bar, or its ×. No key in the terminal (Esc belongs to the shell) | `find.close` |
 | Quit | Cmd+Q | `app.quit` |
 
 Cmd combinations never reach the shell. A Cmd key with no binding does nothing.
@@ -53,6 +57,32 @@ key sends nothing: it does not reach the shell.
 New tabs and splits start in the active pane's directory. The directory comes from
 OSC 7, which the zsh integration sends before each prompt. Without OSC 7 the app asks
 the OS for the shell's directory by its process id (macOS only).
+
+## Find
+
+Cmd+F opens a find bar at the top right of the focused pane. It searches that pane's
+scrollback and screen as you type. Every match is highlighted, and the current one has
+its own color (`find_match`, `find_current` and `find_text` in the theme). A selection
+in the terminal (its first line) becomes the query. Without one, the last query comes
+back, selected.
+
+- `.*` makes the query a regular expression (Rust `regex` syntax). An invalid one turns
+  the bar red and shows "Invalid regex". `Aa` makes it case-sensitive. Both start off.
+- Matches are counted from the newest output up, as in Warp: `1/163` is the match
+  nearest the bottom. Next (Enter, Cmd+G, ↓) goes to older output, previous
+  (Shift+Enter, Cmd+Shift+G, ↑) to newer. Moving to a match off screen centers it.
+- Esc or × closes the bar and clears the highlights. The view stays where it is.
+- New output reruns the search at most every 150 ms, on a background thread, and the
+  current match stays current. A search over a full scrollback (10,000 lines) takes
+  about 15 ms in a release build.
+- At most 10,000 matches are kept, the newest ones. The counter then ends in `+`.
+- In the bar, Option+Backspace deletes a word, Cmd+Backspace clears the query and Cmd+V
+  pastes its first line. The other command-line keys do nothing there, and no key in the
+  bar reaches the shell.
+- Each pane has its own bar and query.
+
+The search itself is `term_session::Finder` (`crates/term-session/src/search.rs`). It
+runs `alacritty_terminal`'s `RegexIter` over the whole buffer, as Zed does.
 
 ## Settings
 
@@ -152,6 +182,9 @@ instead, so no Xcode install is needed. Cost: the first launch compiles the
 shaders, so startup is a little slower.
 
 ## Known gaps (M2)
+
+- The find input takes typed text only (no IME), and has no movable cursor.
+- Warp's "search within the selected block" toggle waits for blocks (M3).
 
 - Cmd+W closes the focused pane. Closing a whole tab is the palette's "Close tab", the
   tab's × or a middle-click on the tab.

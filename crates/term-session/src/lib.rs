@@ -7,6 +7,7 @@ mod blocks;
 mod cwd;
 mod links;
 mod osc133;
+mod search;
 mod session;
 mod timing;
 
@@ -15,8 +16,9 @@ pub use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor};
 pub use blocks::{Block, Blocks};
 pub use links::Link;
 pub use osc133::{parse_payload, Mark, Scanner};
+pub use search::{BufferPoint, FindMatch, FindQuery, FindResults, MAX_MATCHES};
 pub use session::{
-    Cursor, Damage, LineDamage, Session, SessionEvent, Side, SelectionKind, Snapshot,
+    Cursor, Damage, Finder, LineDamage, Session, SessionEvent, Side, SelectionKind, Snapshot,
     SnapshotCell, TermMode,
 };
 pub use timing::StartupTimer;

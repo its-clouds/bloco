@@ -28,6 +28,9 @@ pub struct Palette {
     pub background: Hsla,
     pub cursor: Hsla,
     pub selection: Hsla,
+    pub find_match: Hsla,
+    pub find_current: Hsla,
+    pub find_text: Hsla,
     pub chrome: Chrome,
 }
 
@@ -44,6 +47,9 @@ impl Palette {
             background: hsla(theme.background),
             cursor: hsla(theme.cursor),
             selection: hsla(theme.selection),
+            find_match: hsla(theme.find_match),
+            find_current: hsla(theme.find_current),
+            find_text: hsla(theme.find_text),
             chrome: Chrome {
                 tab_bar: hsla(chrome.tab_bar),
                 tab_active: hsla(chrome.tab_active),

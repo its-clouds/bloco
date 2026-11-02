@@ -32,6 +32,12 @@ pub struct Theme {
     pub foreground: Rgb,
     pub cursor: Rgb,
     pub selection: Rgb,
+    /// Background of every find match.
+    pub find_match: Rgb,
+    /// Background of the current find match.
+    pub find_current: Rgb,
+    /// Text drawn over a find match.
+    pub find_text: Rgb,
     /// The 16 ANSI colors, black through bright white.
     pub ansi: [Rgb; 16],
     pub chrome: Chrome,
@@ -57,6 +63,9 @@ impl Theme {
             foreground: Rgb(0xc5c8c6),
             cursor: Rgb(0xc5c8c6),
             selection: Rgb(0x373b41),
+            find_match: Rgb(0xf0c674),
+            find_current: Rgb(0xde935f),
+            find_text: Rgb(0x1d1f21),
             ansi: [
                 Rgb(0x1d1f21),
                 Rgb(0xcc6666),
@@ -99,6 +108,9 @@ impl Theme {
             foreground: Rgb(0x383a42),
             cursor: Rgb(0x526fff),
             selection: Rgb(0xd7dae0),
+            find_match: Rgb(0xffe08a),
+            find_current: Rgb(0xff9f43),
+            find_text: Rgb(0x383a42),
             ansi: [
                 Rgb(0x383a42),
                 Rgb(0xe45649),

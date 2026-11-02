@@ -21,6 +21,7 @@ use crate::blocks::{Block, Blocks};
 use crate::cwd::pid_cwd;
 use crate::links;
 use crate::osc133::{Mark, Scanner};
+use crate::search::{self, FindQuery, FindResults};
 
 pub use alacritty_terminal::index::Side;
 pub use alacritty_terminal::selection::SelectionType as SelectionKind;
@@ -94,6 +95,9 @@ pub struct Snapshot {
     pub cursor: Cursor,
     /// Lines changed since the previous snapshot. Taking a snapshot resets damage.
     pub damage: Damage,
+    /// The buffer line (see [`BufferPoint`](crate::BufferPoint)) shown on the
+    /// first viewport line.
+    pub top_line: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -152,7 +156,6 @@ impl Snapshot {
     pub fn line(&self, line: usize) -> &[SnapshotCell] {
         &self.cells[line * self.columns..(line + 1) * self.columns]
     }
-
 }
 
 impl Session {
@@ -327,6 +330,7 @@ impl Session {
             cells,
             cursor,
             damage,
+            top_line: term.grid().history_size() - term.grid().display_offset(),
         }
     }
 
@@ -347,6 +351,32 @@ impl Session {
     pub fn scroll_to_bottom(&self) {
         let mut state = self.state.lock().expect("state lock poisoned");
         state.term.scroll_display(Scroll::Bottom);
+    }
+
+    /// Scrolls so a buffer line (see [`BufferPoint`](crate::BufferPoint)) is on
+    /// screen. A line that is already visible does not move. Any other line is
+    /// put in the middle of the screen, as far as the scrollback allows.
+    pub fn scroll_to_line(&self, line: usize) {
+        let mut state = self.state.lock().expect("state lock poisoned");
+        let term = &mut state.term;
+        let history = term.grid().history_size();
+        let offset = term.grid().display_offset();
+        let rows = term.screen_lines();
+        let top = history - offset;
+        if (top..top + rows).contains(&line) {
+            return;
+        }
+        // The viewport starts at buffer line `history - offset`.
+        let wanted = (history + rows / 2).saturating_sub(line).min(history);
+        term.scroll_display(Scroll::Delta(wanted as i32 - offset as i32));
+    }
+
+    /// A handle that runs find queries on this session's buffer. It can be sent
+    /// to a background thread.
+    pub fn finder(&self) -> Finder {
+        Finder {
+            state: self.state.clone(),
+        }
     }
 
     /// Starts a selection at a viewport cell. `line` and `column` are viewport
@@ -402,6 +432,21 @@ impl Session {
             .blocks
             .all()
             .to_vec()
+    }
+}
+
+/// Runs find queries on a session's buffer, from any thread. See [`Session::finder`].
+#[derive(Clone)]
+pub struct Finder {
+    state: Arc<Mutex<State>>,
+}
+
+impl Finder {
+    /// Every match of `query` in the scrollback and on the screen, oldest first.
+    /// Holds the terminal lock while it searches, so output waits until it is done.
+    pub fn find(&self, query: &FindQuery) -> Result<FindResults, String> {
+        let state = self.state.lock().expect("state lock poisoned");
+        search::find_all(&state.term, query)
     }
 }
 

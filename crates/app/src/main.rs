@@ -3,6 +3,7 @@
 
 mod colors;
 mod commands;
+mod find;
 mod keys;
 mod mouse;
 mod option_key;
@@ -16,7 +17,8 @@ use gpui::{App, AppContext, Bounds, Menu, MenuItem, WindowBounds, WindowOptions,
 use gpui_platform::application;
 
 use commands::{
-    ClosePane, CloseTab, CopySelection, NewTab, PasteClipboard, QuitApp, SplitDown, SplitRight,
+    ClosePane, CloseTab, CopySelection, FindNext, FindOpen, FindPrevious, NewTab, PasteClipboard,
+    QuitApp, SplitDown, SplitRight,
 };
 use workspace::Workspace;
 
@@ -51,6 +53,10 @@ fn main() {
                 items: vec![
                     MenuItem::action("Copy", CopySelection),
                     MenuItem::action("Paste", PasteClipboard),
+                    MenuItem::separator(),
+                    MenuItem::action("Find…", FindOpen),
+                    MenuItem::action("Find Next", FindNext),
+                    MenuItem::action("Find Previous", FindPrevious),
                 ],
                 disabled: false,
             },

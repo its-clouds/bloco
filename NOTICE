@@ -15,6 +15,7 @@ GPL-3.0-or-later code is distributed here under GPL-3.0 terms.
 | crates/app/src/mouse.rs | crates/terminal/src/mappings/mouse.rs |
 | crates/app/src/terminal_element.rs | crates/terminal_view/src/terminal_element.rs (layout approach: batched runs, force width) |
 | crates/app/src/terminal_view.rs | crates/terminal_view/src/terminal_view.rs and terminal_element.rs (InputHandler, key_down) |
+| crates/term-session/src/search.rs | crates/terminal/src/alacritty.rs (`all_search_matches`: whole-buffer search with alacritty's `RegexIter`) |
 
 Dependencies: GPUI (Apache-2.0, from the same Zed commit). The crates.io
 dependencies of term-session are audited in spikes/ui-toolkit/spike-core/README.md.

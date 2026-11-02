@@ -1,5 +1,5 @@
-//! The terminal view: keyboard, mouse, clipboard and IME handling. The grid
-//! itself is drawn by `terminal_element.rs`.
+//! The terminal view: keyboard, mouse, clipboard and IME handling, and the find
+//! bar. The grid itself is drawn by `terminal_element.rs`.
 //!
 //! Key handling follows `zed-industries/zed`, crates/terminal_view/src/terminal_view.rs
 //! (GPL-3.0-or-later). See NOTICE.
@@ -9,22 +9,25 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_channel::Receiver;
 use config::OptionAsMeta;
 use gpui::{
-    App, Bounds, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    AnyElement, App, Bounds, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
     InputHandler, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Render, ScrollEvent, SharedString, UTF16Selection, Window, div,
-    prelude::*,
+    MouseUpEvent, Pixels, Point, Render, ScrollEvent, SharedString, Task, UTF16Selection, Window,
+    div, prelude::*, px, relative,
 };
-use term_session::{Link, SelectionKind, Session, SessionEvent, TermMode};
+use term_session::{FindQuery, Link, SelectionKind, Session, SessionEvent, TermMode};
 
 use crate::colors::Palette;
 use crate::commands::{
-    CopySelection, PasteClipboard, TextDeleteToLineStart, TextDeleteWordBack, TextLineEnd,
-    TextLineStart, TextWordBack, TextWordForward,
+    CopySelection, FindClose, FindNext, FindOpen, FindPrevious, PasteClipboard,
+    TextDeleteToLineStart, TextDeleteWordBack, TextLineEnd, TextLineStart, TextWordBack,
+    TextWordForward,
 };
+use crate::find::{FindState, Pick};
 use crate::keys::{TextEdit, text_edit_bytes, to_esc_str};
 use crate::mouse::{alt_scroll, mouse_button_report, mouse_moved_report, scroll_report};
 use crate::option_key::option_keys_down;
@@ -52,6 +55,11 @@ pub struct TerminalStyle {
     pub option_as_meta: OptionAsMeta,
 }
 
+/// How long new output waits before it reruns an open search. Output during the
+/// wait joins the same run, so a busy shell searches a few times a second at most.
+const FIND_REFRESH: Duration = Duration::from_millis(150);
+const FIND_BAR_WIDTH: f32 = 400.0;
+
 /// A URL under the mouse while Cmd is held.
 struct HoveredLink {
     line: usize,
@@ -75,6 +83,15 @@ pub struct TerminalView {
     scroll_pixels: f32,
     /// The tab label as of the last output, to report only real changes.
     tab_label: String,
+    /// The find bar, while it is open.
+    find: Option<FindState>,
+    find_focus: FocusHandle,
+    /// The query of the last closed find bar, offered again when it reopens.
+    last_find: FindQuery,
+    /// The search that is running. Replacing it cancels the older one.
+    find_task: Option<Task<()>>,
+    /// New output is waiting to rerun the search.
+    find_refresh_pending: bool,
 }
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
@@ -113,6 +130,11 @@ impl TerminalView {
             hovered_link: None,
             scroll_pixels: 0.0,
             tab_label,
+            find: None,
+            find_focus: cx.focus_handle(),
+            last_find: FindQuery::default(),
+            find_task: None,
+            find_refresh_pending: false,
         }
     }
 
@@ -143,6 +165,7 @@ impl TerminalView {
                     self.tab_label = label;
                     cx.emit(TerminalEvent::TabTitleChanged);
                 }
+                self.schedule_find_refresh(cx);
                 cx.notify();
             }
             SessionEvent::Title(title) => cx.emit(TerminalEvent::Title(title)),
@@ -275,6 +298,302 @@ impl TerminalView {
             self.send_input(bytes.as_bytes());
         }
         cx.notify();
+    }
+
+    /// Cmd+F: opens the find bar, or selects its query when it is open. A
+    /// selection in the terminal (its first line) becomes the query.
+    fn open_find(&mut self, _: &FindOpen, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(find) = self.find.as_mut() {
+            find.all_selected = !find.query.text.is_empty();
+            window.focus(&self.find_focus, cx);
+            cx.notify();
+            return;
+        }
+        let selected = self
+            .session
+            .selection_text()
+            .and_then(|text| text.lines().next().map(str::to_string))
+            .filter(|line| !line.trim().is_empty());
+        let mut query = self.last_find.clone();
+        let all_selected = match selected {
+            Some(text) => {
+                query.text = text;
+                false
+            }
+            None => !query.text.is_empty(),
+        };
+        self.find = Some(FindState::new(query, all_selected));
+        window.focus(&self.find_focus, cx);
+        self.run_find(Pick::Newest, cx);
+        cx.notify();
+    }
+
+    /// Esc or ×: closes the bar and clears the highlights. The view stays where
+    /// it is, on the last current match.
+    fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(find) = self.find.take() {
+            self.last_find = find.query;
+        }
+        self.find_task = None;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    fn find_next(&mut self, _: &FindNext, window: &mut Window, cx: &mut Context<Self>) {
+        self.step_find(true, window, cx);
+    }
+
+    fn find_previous(&mut self, _: &FindPrevious, window: &mut Window, cx: &mut Context<Self>) {
+        self.step_find(false, window, cx);
+    }
+
+    /// Moves to the next (older) or previous (newer) match and scrolls to it.
+    /// With the bar closed, opens it first.
+    fn step_find(&mut self, older: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(find) = self.find.as_mut() else {
+            self.open_find(&FindOpen, window, cx);
+            return;
+        };
+        let found = if older { find.next() } else { find.previous() };
+        if let Some(found) = found {
+            self.session.scroll_to_line(found.start.line);
+        }
+        cx.notify();
+    }
+
+    /// Searches the buffer on a background thread with the current query.
+    fn run_find(&mut self, pick: Pick, cx: &mut Context<Self>) {
+        let Some(find) = self.find.as_ref() else {
+            return;
+        };
+        let query = find.query.clone();
+        let generation = find.generation;
+        let finder = self.session.finder();
+        self.find_task = Some(cx.spawn(async move |this, cx| {
+            let results = cx
+                .background_spawn(async move { finder.find(&query) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                let Some(find) = view.find.as_mut() else {
+                    return;
+                };
+                if !find.set_results(generation, results, pick) {
+                    return;
+                }
+                if pick == Pick::Newest {
+                    if let Some(found) = find.current_match() {
+                        view.session.scroll_to_line(found.start.line);
+                    }
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// New output while the bar is open reruns the search after a short wait.
+    fn schedule_find_refresh(&mut self, cx: &mut Context<Self>) {
+        let searching = self.find.as_ref().is_some_and(|f| !f.query.text.is_empty());
+        if !searching || self.find_refresh_pending {
+            return;
+        }
+        self.find_refresh_pending = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(FIND_REFRESH).await;
+            let _ = this.update(cx, |view, cx| {
+                view.find_refresh_pending = false;
+                view.run_find(Pick::Keep, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Changes the query through `edit` and searches again.
+    fn edit_find(&mut self, cx: &mut Context<Self>, edit: impl FnOnce(&mut FindState)) {
+        if let Some(find) = self.find.as_mut() {
+            edit(find);
+            self.run_find(Pick::Newest, cx);
+            cx.notify();
+        }
+    }
+
+    /// Keys typed into the find bar. They never reach the shell.
+    fn find_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        let modifiers = keystroke.modifiers;
+        if modifiers.platform {
+            // Cmd+A selects the query. Other Cmd keys are shortcuts (the keymap
+            // has already had them).
+            if keystroke.key == "a" {
+                if let Some(find) = self.find.as_mut() {
+                    find.all_selected = !find.query.text.is_empty();
+                    cx.notify();
+                }
+                cx.stop_propagation();
+            }
+            return;
+        }
+        cx.stop_propagation();
+        if modifiers.control {
+            return;
+        }
+        match keystroke.key.as_str() {
+            "escape" => self.close_find(window, cx),
+            "enter" => self.step_find(!modifiers.shift, window, cx),
+            "backspace" => self.edit_find(cx, FindState::pop_char),
+            "tab" | "up" | "down" | "left" | "right" | "home" | "end" | "pageup" | "pagedown" => {}
+            _ => {
+                if let Some(text) = keystroke.key_char.clone() {
+                    self.edit_find(cx, |find| find.push_text(&text));
+                }
+            }
+        }
+    }
+
+    fn paste_into_find(&mut self, _: &PasteClipboard, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        // A query is one line: a pasted line break ends it.
+        let line = text.lines().next().unwrap_or_default().to_string();
+        self.edit_find(cx, |find| find.push_text(&line));
+    }
+
+    fn render_find_bar(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let find = self.find.as_ref()?;
+        let chrome = &self.palette.chrome;
+        let focused = self.find_focus.is_focused(window);
+        let empty = find.query.text.is_empty();
+
+        let input = div()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .items_center()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .child(
+                div()
+                    .when(empty, |d| d.text_color(chrome.muted).child("Find"))
+                    .when(!empty, |d| d.child(find.query.text.clone()))
+                    .when(find.all_selected, |d| d.bg(self.palette.selection)),
+            )
+            .when(focused && !find.all_selected, |d| {
+                d.child(div().flex_shrink_0().w(px(1.)).h(px(14.)).bg(chrome.text))
+            });
+
+        let toggle = |id: &'static str, label: &'static str, on: bool| {
+            div()
+                .id(id)
+                .flex_shrink_0()
+                .px_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .text_color(if on { chrome.accent } else { chrome.muted })
+                .when(on, |d| d.bg(chrome.selected))
+                .hover(|d| d.bg(chrome.close_hover))
+                .child(label)
+        };
+        let button = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .flex_shrink_0()
+                .px_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .text_color(chrome.muted)
+                .hover(|d| d.bg(chrome.close_hover).text_color(chrome.text))
+                .child(label)
+        };
+
+        Some(
+            div()
+                .id("find-bar")
+                .absolute()
+                .top(px(6.))
+                .right(px(12.))
+                .w(px(FIND_BAR_WIDTH))
+                .max_w(relative(0.9))
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .text_sm()
+                .bg(chrome.overlay)
+                .text_color(chrome.text)
+                .border_1()
+                .border_color(if find.invalid { chrome.error } else { chrome.divider })
+                .rounded_md()
+                .track_focus(&self.find_focus)
+                .key_context("FindBar")
+                .on_key_down(cx.listener(Self::find_key))
+                .on_action(cx.listener(Self::paste_into_find))
+                .on_action(cx.listener(|view, _: &TextDeleteWordBack, _, cx| {
+                    view.edit_find(cx, FindState::delete_word)
+                }))
+                .on_action(cx.listener(|view, _: &TextDeleteToLineStart, _, cx| {
+                    view.edit_find(cx, FindState::clear)
+                }))
+                // The input has no cursor to move, and these keys must not reach the shell.
+                .on_action(|_: &TextWordBack, _, _| {})
+                .on_action(|_: &TextWordForward, _, _| {})
+                .on_action(|_: &TextLineStart, _, _| {})
+                .on_action(|_: &TextLineEnd, _, _| {})
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|view, _: &MouseDownEvent, window, cx| {
+                        window.focus(&view.find_focus, cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .child(input)
+                .child(toggle("find-regex", ".*", find.query.regex).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|view, _: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        window.focus(&view.find_focus, cx);
+                        view.edit_find(cx, FindState::toggle_regex);
+                    }),
+                ))
+                .child(toggle("find-case", "Aa", find.query.case_sensitive).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|view, _: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        window.focus(&view.find_focus, cx);
+                        view.edit_find(cx, FindState::toggle_case);
+                    }),
+                ))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .min_w(px(64.))
+                        .text_color(if find.invalid { chrome.error } else { chrome.muted })
+                        .child(find.counter()),
+                )
+                .child(button("find-next", "↓").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|view, _: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        view.step_find(true, window, cx);
+                    }),
+                ))
+                .child(button("find-previous", "↑").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|view, _: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        view.step_find(false, window, cx);
+                    }),
+                ))
+                .child(button("find-close", "×").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|view, _: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        view.close_find(window, cx);
+                    }),
+                ))
+                .into_any_element(),
+        )
     }
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -443,15 +762,26 @@ impl Render for TerminalView {
             .hovered_link
             .as_ref()
             .map(|h| (h.line, h.link.first_column, h.link.last_column));
+        let find = self
+            .find
+            .as_ref()
+            .filter(|find| !find.query.text.is_empty())
+            .map(|find| (find.matches.clone(), find.current));
+        let find_bar = self.render_find_bar(window, cx);
 
         div()
             .id("terminal")
+            .relative()
             .size_full()
             .bg(self.palette.background)
             .track_focus(&self.focus_handle)
             .key_context("Terminal")
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::open_find))
+            .on_action(cx.listener(Self::find_next))
+            .on_action(cx.listener(Self::find_previous))
+            .on_action(cx.listener(|view, _: &FindClose, window, cx| view.close_find(window, cx)))
             .on_action(
                 cx.listener(|view, _: &TextWordBack, _, cx| view.text_edit(TextEdit::WordBack, cx)),
             )
@@ -492,7 +822,9 @@ impl Render for TerminalView {
                 focused,
                 marked_text: self.marked_text.clone(),
                 hovered_link,
+                find,
             })
+            .children(find_bar)
     }
 }
 
