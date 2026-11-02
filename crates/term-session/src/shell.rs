@@ -136,7 +136,7 @@ mod tests {
 
     use super::*;
     use crate::blocks::Row;
-    use crate::session::Session;
+    use crate::session::{Session, TermMode};
 
     /// The path of the shell called `name` on `PATH`, if it is installed.
     fn find_shell(name: &str) -> Option<String> {
@@ -334,6 +334,154 @@ mod tests {
         assert!(session
             .previous_block(previous.prompt_line.unwrap())
             .is_none());
+    }
+
+    /// Waits until `count` blocks have finished.
+    fn wait_for_finished(session: &Session, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while session
+            .blocks()
+            .iter()
+            .filter(|b| b.exit_code.is_some())
+            .count()
+            < count
+        {
+            assert!(
+                Instant::now() < deadline,
+                "fewer than {count} finished blocks"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Checks the first blocks against `expected` (command and output pairs), in
+    /// the view of `rows` lines: each has its header drawn, and reads back its
+    /// output. Navigation finds every block, from the bottom and from the top.
+    fn assert_blocks_intact(session: &Session, rows: usize, expected: &[(&str, &str)]) {
+        let blocks = session.blocks();
+        for (block, (command, output)) in blocks.iter().zip(expected) {
+            assert_eq!(block.command.as_deref(), Some(*command));
+            assert_eq!(
+                session.block_output(block.id).as_deref(),
+                Some(*output),
+                "output of {command}"
+            );
+            session.scroll_top_to(block.prompt_line.unwrap());
+            let frame = session.frame(None);
+            assert!(
+                frame.rows.contains(&Row::Header(block.id)),
+                "header of {command}: {:?}",
+                frame.rows
+            );
+        }
+
+        let ids: Vec<u64> = blocks.iter().map(|b| b.id).collect();
+        session.scroll_to_bottom();
+        let mut line = session.top_line() + rows;
+        let mut previous = Vec::new();
+        while let Some(block) = session.previous_block(line) {
+            line = block.prompt_line.unwrap();
+            previous.push(block.id);
+        }
+        previous.reverse();
+        assert_eq!(previous, ids, "previous block from the bottom");
+
+        let mut line = blocks[0].prompt_line.unwrap();
+        let mut next = vec![blocks[0].id];
+        while let Some(block) = session.next_block(line) {
+            line = block.prompt_line.unwrap();
+            next.push(block.id);
+        }
+        assert_eq!(next, ids, "next block from the first");
+    }
+
+    /// Rewrapping moves buffer lines, so each block has to follow its own text
+    /// through width and height changes. One command's output is wider than the
+    /// narrow widths, so its rows change on every width change.
+    #[test]
+    fn blocks_survive_width_and_height_changes() {
+        let Some(shell) = find_shell("bash") else {
+            eprintln!("skipping: bash is not installed");
+            return;
+        };
+        let session = Session::spawn_shell(&shell, 80, 24, None, |_| {}).unwrap();
+        let wide = "a".repeat(100);
+        let echo_wide = format!("echo {wide}");
+        let seq = (1..=30)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let expected = [
+            ("echo one", "one"),
+            (echo_wide.as_str(), wide.as_str()),
+            ("seq 1 30", seq.as_str()),
+            ("echo last", "last"),
+        ];
+        for (command, _) in &expected {
+            session.write(format!("{command}\r").as_bytes()).unwrap();
+        }
+        wait_for_finished(&session, expected.len());
+        assert_blocks_intact(&session, 24, &expected);
+
+        // Not narrower than the prompt: readline redraws a prompt that wraps when
+        // the width changes, and that redraw overwrites the rows above it.
+        for (cols, rows) in [(40, 24), (120, 24), (120, 12), (40, 10), (80, 24)] {
+            session.resize(cols, rows).unwrap();
+            // The shell redraws its prompt when it gets the new size.
+            std::thread::sleep(Duration::from_millis(200));
+            assert_blocks_intact(&session, rows as usize, &expected);
+        }
+
+        // Collapse still hides the output of a block after the resizes.
+        let blocks = session.blocks();
+        let seq_block = &blocks[2];
+        session.toggle_block(seq_block.id);
+        session.scroll_top_to(seq_block.prompt_line.unwrap());
+        let frame = session.frame(None);
+        assert!(
+            frame.rows.contains(&Row::Header(seq_block.id)),
+            "{:?}",
+            frame.rows
+        );
+        assert!(!frame
+            .rows
+            .contains(&Row::Line(seq_block.output_line.unwrap() + 1)));
+        session.toggle_block(seq_block.id);
+    }
+
+    /// A full-screen app runs on the alternate screen. A height change made while
+    /// it runs keeps the blocks of the primary screen, which are drawn again when
+    /// the app exits.
+    #[test]
+    fn blocks_survive_a_height_change_under_a_full_screen_app() {
+        let Some(shell) = find_shell("bash") else {
+            eprintln!("skipping: bash is not installed");
+            return;
+        };
+        let session = Session::spawn_shell(&shell, 80, 24, None, |_| {}).unwrap();
+        let wide = "a".repeat(100);
+        let echo_wide = format!("echo {wide}");
+        let expected = [("echo one", "one"), (echo_wide.as_str(), wide.as_str())];
+        for (command, _) in &expected {
+            session.write(format!("{command}\r").as_bytes()).unwrap();
+        }
+        wait_for_finished(&session, expected.len());
+
+        // `read` waits for a line, as a full-screen app waits for keys.
+        session
+            .write(b"printf '\\033[?1049h'; read -r x; printf '\\033[?1049l'\r")
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !session.mode().contains(TermMode::ALT_SCREEN) {
+            assert!(Instant::now() < deadline, "no alternate screen");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        session.resize(80, 12).unwrap();
+        session.write(b"\r").unwrap();
+        wait_for_finished(&session, 3);
+        assert!(!session.mode().contains(TermMode::ALT_SCREEN));
+
+        assert_blocks_intact(&session, 24, &expected);
     }
 
     #[test]

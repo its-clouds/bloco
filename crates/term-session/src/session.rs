@@ -22,6 +22,7 @@ use crate::blocks::{self, Block, Blocks, Row};
 use crate::cwd::pid_cwd;
 use crate::links;
 use crate::osc133::{Mark, Scanner};
+use crate::reflow::Layout;
 use crate::search::{self, BufferPoint, FindQuery, FindResults};
 use crate::shell::{self, ScriptDir};
 
@@ -403,7 +404,9 @@ impl Session {
     }
 
     /// Resizes the PTY (which sends SIGWINCH to the shell) and the terminal grid.
-    /// A width change rewraps the buffer, so the blocks forget their positions.
+    /// A width change rewraps the buffer, so the block positions are carried to
+    /// the same text in the new buffer (see the `reflow` module). On the alternate
+    /// screen the primary buffer cannot be read, so a width change forgets them.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         self.master.resize(pty_size(cols, rows))?;
         let mut guard = self.state.lock().expect("state lock poisoned");
@@ -412,11 +415,18 @@ impl Session {
             blocks,
             scrollback,
         } = &mut *guard;
-        if cols as usize != term.columns() {
-            scrollback.stop(term);
-            blocks.forget_positions();
+        scrollback.stop(term);
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            // A height change keeps the lines of the primary buffer in place.
+            if cols as usize != term.columns() {
+                blocks.forget_positions();
+            }
+            term.resize(TermSize::new(cols as usize, rows as usize));
+            return Ok(());
         }
+        let anchors = blocks.anchors(&Layout::of(term));
         term.resize(TermSize::new(cols as usize, rows as usize));
+        blocks.restore(&anchors, &Layout::of(term));
         Ok(())
     }
 
