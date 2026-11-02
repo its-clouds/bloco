@@ -9,6 +9,7 @@
 //! The layout follows `zed-industries/zed`, crates/terminal_view/src/terminal_element.rs
 //! (GPL-3.0-or-later). See NOTICE.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -19,8 +20,9 @@ use gpui::{
     StrikethroughStyle, TextAlign, TextRun, UnderlineStyle, Window, fill, outline, point, px,
     relative, size,
 };
-use term_session::{CursorShape, FindMatch, Flags, Session, Side, SnapshotCell};
+use term_session::{Block, CursorShape, FindMatch, Flags, Frame, Row, Session, Side, SnapshotCell};
 
+use crate::block_header::header_text;
 use crate::colors::{Palette, dim};
 use crate::find::visible_spans;
 use crate::terminal_view::TerminalView;
@@ -92,6 +94,11 @@ pub struct TerminalElement {
     pub cursor_on: bool,
     /// The visual bell is flashing: the pane is tinted.
     pub bell: bool,
+    /// Written on each frame: what each visual row shows. The view maps mouse
+    /// positions through it.
+    pub rows: Rc<RefCell<Vec<Row>>>,
+    /// The selected block, highlighted with its output.
+    pub selected: Option<u64>,
 }
 
 /// What `prepaint` decided to draw. `paint` only issues the draw calls.
@@ -188,7 +195,15 @@ impl Element for TerminalElement {
         self.metrics.set(metrics);
 
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
-        let snapshot = self.session.snapshot();
+        let Frame {
+            rows: visual,
+            columns: frame_columns,
+            cells,
+            cursor,
+            headers,
+            sticky,
+            selected,
+        } = self.session.frame(self.selected);
 
         let mut prepaint = Prepaint {
             hitbox,
@@ -198,8 +213,7 @@ impl Element for TerminalElement {
             ime_bounds: None,
         };
 
-        let cursor = snapshot.cursor;
-        let cursor_on_screen = cursor.visible && cursor.line < snapshot.rows;
+        let cursor_on_screen = cursor.visible && cursor.line < visual.len();
         // The preedit covers the cells it is drawn over, so cell text there is skipped.
         let preedit = self.marked_text.as_deref().filter(|t| !t.is_empty());
         let preedit_cover = match (preedit, cursor_on_screen) {
@@ -211,41 +225,56 @@ impl Element for TerminalElement {
         };
         let block_cursor =
             self.focused && cursor_on_screen && self.cursor_on && cursor.shape == CursorShape::Block;
-        let found = match &self.find {
-            Some((matches, current)) => visible_spans(
-                matches,
-                *current,
-                snapshot.top_line,
-                snapshot.rows,
-                snapshot.columns,
-            ),
-            None => vec![Vec::new(); snapshot.rows],
-        };
-
-        for line in 0..snapshot.rows {
-            self.layout_line(
-                window,
-                &mut prepaint,
-                &metrics,
-                snapshot.line(line),
-                line,
-                |column| {
-                    block_cursor && line == cursor.line && column == cursor.column
-                },
-                &found[line],
-                preedit_cover,
-            );
+        let found = self.found_per_row(&visual, frame_columns);
+        if let Some(rows) = &selected {
+            let tint = self.palette.chrome.accent.opacity(0.12);
+            for line in rows.clone() {
+                prepaint
+                    .rects
+                    .push((metrics.cell_bounds(line, 0, frame_columns), tint));
+            }
         }
 
-        if let Some((line, first, last)) = self.hovered_link {
-            let x_start = metrics.cell_bounds(line, first, 1).origin.x;
-            let width = metrics.cell_width * (last + 1 - first) as f32;
-            let y = metrics.cell_bounds(line, 0, 1).origin.y + line_height - px(1.);
-            prepaint.rects.push((
-                Bounds::new(point(x_start, y), size(width, px(1.))),
-                self.palette.foreground,
-            ));
+        for (line, row) in visual.iter().enumerate() {
+            match row {
+                // The sticky header covers the top row, so its text is not drawn.
+                Row::Line(_) if line == 0 && sticky.is_some() => {}
+                Row::Line(_) => {
+                    let row_cells = &cells[line * frame_columns..(line + 1) * frame_columns];
+                    self.layout_line(
+                        window,
+                        &mut prepaint,
+                        &metrics,
+                        row_cells,
+                        line,
+                        |column| {
+                            block_cursor && line == cursor.line && column == cursor.column
+                        },
+                        &found[line],
+                        preedit_cover,
+                    );
+                }
+                Row::Header(id) => {
+                    if let Some(block) = headers.iter().find(|block| block.id == *id) {
+                        let selected = self.selected == Some(block.id);
+                        self.header(
+                            window,
+                            &mut prepaint,
+                            &metrics,
+                            block,
+                            line,
+                            frame_columns,
+                            selected,
+                        );
+                    }
+                }
+            }
         }
+        if let Some(block) = &sticky {
+            let selected = self.selected == Some(block.id);
+            self.header(window, &mut prepaint, &metrics, block, 0, frame_columns, selected);
+        }
+        *self.rows.borrow_mut() = visual;
 
         if cursor_on_screen {
             let cell = metrics.cell_bounds(cursor.line, cursor.column, 1);
@@ -270,6 +299,16 @@ impl Element for TerminalElement {
                     _ => None,
                 }
             };
+        }
+
+        if let Some((line, first, last)) = self.hovered_link {
+            let x_start = metrics.cell_bounds(line, first, 1).origin.x;
+            let width = metrics.cell_width * (last + 1 - first) as f32;
+            let y = metrics.cell_bounds(line, 0, 1).origin.y + line_height - px(1.);
+            prepaint.rects.push((
+                Bounds::new(point(x_start, y), size(width, px(1.))),
+                self.palette.foreground,
+            ));
         }
 
         if let (Some(text), Some((line, column, _))) = (preedit, preedit_cover) {
@@ -488,6 +527,96 @@ impl TerminalElement {
                 .push((metrics.cell_bounds(line, start, row.len() - start), color));
         }
         flush(window, self, out, metrics, line, &mut batch);
+    }
+
+    /// The find highlights of each visual row. A header row has none.
+    fn found_per_row(&self, rows: &[Row], columns: usize) -> Vec<Vec<(usize, usize, bool)>> {
+        let Some((matches, current)) = &self.find else {
+            return vec![Vec::new(); rows.len()];
+        };
+        let lines = || {
+            rows.iter().filter_map(|row| match row {
+                Row::Line(line) => Some(*line),
+                Row::Header(_) => None,
+            })
+        };
+        let (Some(first), Some(last)) = (lines().min(), lines().max()) else {
+            return vec![Vec::new(); rows.len()];
+        };
+        let spans = visible_spans(matches, *current, first, last - first + 1, columns);
+        rows.iter()
+            .map(|row| match row {
+                Row::Line(line) => spans[line - first].clone(),
+                Row::Header(_) => Vec::new(),
+            })
+            .collect()
+    }
+
+    /// Draws the header row of `block` on visual row `line`: the command on the
+    /// left, and the status, duration and directory on the right. A selected
+    /// header has an accent bar on its left edge and a stronger background.
+    #[allow(clippy::too_many_arguments)]
+    fn header(
+        &self,
+        window: &mut Window,
+        out: &mut Prepaint,
+        metrics: &Metrics,
+        block: &Block,
+        line: usize,
+        columns: usize,
+        selected: bool,
+    ) {
+        let chrome = &self.palette.chrome;
+        let text = header_text(block, columns);
+        let y = metrics.origin.y + metrics.line_height * line as f32;
+        let background = if selected {
+            chrome.accent.opacity(0.3)
+        } else {
+            chrome.tab_bar
+        };
+        out.rects.push((metrics.cell_bounds(line, 0, columns), background));
+        if selected {
+            out.rects.push((
+                Bounds::new(point(metrics.origin.x, y), size(px(3.), metrics.line_height)),
+                chrome.accent,
+            ));
+        }
+        out.rects.push((
+            Bounds::new(
+                point(metrics.origin.x, y),
+                size(metrics.cell_width * columns as f32, px(1.)),
+            ),
+            chrome.divider,
+        ));
+        let style = |fg| RunStyle {
+            fg,
+            bold: false,
+            italic: false,
+            underline: None,
+            strikethrough: false,
+        };
+        if !text.command.is_empty() {
+            let command = Batch {
+                start: 0,
+                cells: text.command.chars().count(),
+                glyph_width: 1,
+                text: text.command.clone(),
+                style: style(chrome.text),
+            };
+            out.text.push(self.shape(window, &command, y, metrics));
+        }
+        let width = text.details.chars().count();
+        if width > 0 {
+            let fg = if text.failed { chrome.error } else { chrome.muted };
+            let details = Batch {
+                start: columns - width,
+                cells: width,
+                glyph_width: 1,
+                text: text.details.clone(),
+                style: style(fg),
+            };
+            out.text.push(self.shape(window, &details, y, metrics));
+        }
     }
 
     fn shape(

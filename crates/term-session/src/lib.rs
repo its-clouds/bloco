@@ -9,16 +9,17 @@ mod links;
 mod osc133;
 mod search;
 mod session;
+mod shell;
 mod timing;
 
 pub use alacritty_terminal::term::cell::Flags;
 pub use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor};
-pub use blocks::{Block, Blocks};
+pub use blocks::{Block, Blocks, Row};
 pub use links::Link;
 pub use osc133::{parse_payload, Mark, Scanner};
 pub use search::{BufferPoint, FindMatch, FindQuery, FindResults, MAX_MATCHES};
 pub use session::{
-    Cursor, Damage, Finder, LineDamage, Session, SessionEvent, Side, SelectionKind, Snapshot,
-    SnapshotCell, TermMode,
+    Cursor, Damage, Finder, Frame, LineDamage, Session, SessionEvent, Side, SelectionKind,
+    Snapshot, SnapshotCell, TermMode,
 };
 pub use timing::StartupTimer;

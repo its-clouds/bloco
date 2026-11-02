@@ -1,6 +1,7 @@
 //! Bloco: a window with tabs, split panes and a command palette. M2 of
 //! `docs/roadmap.md`.
 
+mod block_header;
 mod colors;
 mod commands;
 mod find;
