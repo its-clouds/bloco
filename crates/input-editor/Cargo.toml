@@ -1,0 +1,9 @@
+[package]
+name = "input-editor"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish.workspace = true
+description = "The prompt input editor of Bloco: text buffer, undo, history and highlighting. No UI code."
+
+[dependencies]

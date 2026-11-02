@@ -110,6 +110,10 @@ vendor conf), so users don't need to edit their dotfiles.
   and REPLs work.
 - **FullScreen**: alternate screen active. The pane shows the raw grid.
 
+As built in M4 ([ADR 0003](decisions/0003-input-editor-at-the-prompt.md)): a
+command end (`D`) returns to Unknown, and only the prompt-end mark (`B`) gives
+the keys to the editor. Fish sends no `B`, so it stays in Unknown.
+
 ## Completion engine
 
 1. Tokenize the current input (shell-aware quoting).

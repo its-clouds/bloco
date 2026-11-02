@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 config = { path = "../config" }
 term-session = { path = "../term-session" }
+input-editor = { path = "../input-editor" }
 # Zed's GPUI, pinned to the v1.26.2 release commit. See README.md in this crate.
 gpui = { git = "https://github.com/zed-industries/zed", rev = "c4273271092b0287f7d181f616bd5171e0a2f70c" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "c4273271092b0287f7d181f616bd5171e0a2f70c", features = ["font-kit", "runtime_shaders"] }

@@ -78,12 +78,17 @@ annoys you enough to turn them off.
 
 ## M4 — Input editor
 
+Status: built, and the build and tests pass. The manual checks in the window
+passed on 2026-11-02; see [m4-checklist.md](m4-checklist.md). M4 is done after
+the week of use.
+
 - The editor owns input at the prompt: multi-line, mouse cursor, Opt/Cmd moves,
   undo/redo, syntax highlighting.
 - Shell history search.
 - Session mode switching (prompt / running / full-screen / classic) as in
   [architecture.md](architecture.md#session-mode-state-machine).
-- Decide prompt rendering ([open question 3](open-questions.md#3-prompt-rendering-in-the-input-editor)).
+- Decide prompt rendering ([open question 3](open-questions.md#3-prompt-rendering-in-the-input-editor)),
+  decided in [ADR 0003](decisions/0003-input-editor-at-the-prompt.md): the shell's own prompt.
 
 ## M5 — Completions
 
