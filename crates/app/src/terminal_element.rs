@@ -813,7 +813,7 @@ fn resolve(
     }
     if block_cursor {
         bg = palette.cursor;
-        fg = palette.background;
+        fg = palette.opaque_background;
     }
     (fg, bg)
 }

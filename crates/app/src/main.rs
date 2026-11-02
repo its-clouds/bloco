@@ -12,6 +12,8 @@ mod layout;
 mod mouse;
 mod option_key;
 mod palette;
+mod settings;
+mod sidebar;
 mod split_tree;
 mod terminal_element;
 mod terminal_view;
@@ -22,8 +24,8 @@ use gpui::{App, AppContext, Bounds, Menu, MenuItem, WindowBounds, WindowOptions,
 use gpui_platform::application;
 
 use commands::{
-    ClosePane, CloseTab, CopySelection, FindNext, FindOpen, FindPrevious, NewTab, PasteClipboard,
-    QuitApp, SplitDown, SplitRight,
+    ClosePane, CloseTab, CopySelection, FindNext, FindOpen, FindPrevious, ImportTheme, NewTab,
+    OpenSettings, PasteClipboard, QuitApp, SplitDown, SplitRight, ToggleSidebar,
 };
 use workspace::Workspace;
 
@@ -39,7 +41,11 @@ fn main() {
         cx.set_menus(vec![
             Menu {
                 name: "Bloco".into(),
-                items: vec![MenuItem::action("Quit Bloco", QuitApp)],
+                items: vec![
+                    MenuItem::action("Settings…", OpenSettings),
+                    MenuItem::separator(),
+                    MenuItem::action("Quit Bloco", QuitApp),
+                ],
                 disabled: false,
             },
             Menu {
@@ -50,6 +56,9 @@ fn main() {
                     MenuItem::action("Close Pane", ClosePane),
                     MenuItem::action("Split Right", SplitRight),
                     MenuItem::action("Split Down", SplitDown),
+                    MenuItem::separator(),
+                    MenuItem::action("Toggle Sidebar", ToggleSidebar),
+                    MenuItem::action("Import Theme…", ImportTheme),
                 ],
                 disabled: false,
             },

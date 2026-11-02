@@ -25,7 +25,10 @@ pub struct Chrome {
 pub struct Palette {
     ansi: [Hsla; 16],
     pub foreground: Hsla,
+    /// The default background. Its alpha is the window's background opacity.
     pub background: Hsla,
+    /// The same color with full alpha, for text drawn on the background.
+    pub opaque_background: Hsla,
     pub cursor: Hsla,
     pub selection: Hsla,
     pub find_match: Hsla,
@@ -39,12 +42,18 @@ fn hsla(color: Rgb) -> Hsla {
 }
 
 impl Palette {
-    pub fn from_theme(theme: &Theme) -> Self {
+    /// `opacity` is the window's background opacity, from 0.0 to 1.0.
+    pub fn from_theme(theme: &Theme, opacity: f32) -> Self {
         let chrome = &theme.chrome;
+        let opaque_background = hsla(theme.background);
         Self {
             ansi: theme.ansi.map(hsla),
             foreground: hsla(theme.foreground),
-            background: hsla(theme.background),
+            background: Hsla {
+                a: opacity,
+                ..opaque_background
+            },
+            opaque_background,
             cursor: hsla(theme.cursor),
             selection: hsla(theme.selection),
             find_match: hsla(theme.find_match),

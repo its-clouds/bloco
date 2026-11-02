@@ -4,9 +4,12 @@
 //! No UI code here. The app reads the files with [`Files::read`], parses them
 //! with [`Settings::parse`], and compares the raw text to decide when to reload.
 
+pub mod edit;
+pub mod import;
 pub mod keymap;
 pub mod theme;
 
+use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -14,7 +17,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer};
 
 pub use keymap::{Binding, UNBOUND};
-pub use theme::{Chrome, Rgb, Theme};
+pub use theme::{Chrome, Rgb, Scheme, Theme};
 
 /// `~/.config/bloco`. `None` when `HOME` is not set.
 pub fn default_dir() -> Option<PathBuf> {
@@ -26,15 +29,19 @@ pub fn default_dir() -> Option<PathBuf> {
 pub struct Files {
     pub config: Option<String>,
     pub keymap: Option<String>,
+    /// Theme files in `themes/`, by file name (`nord.itermcolors`). The bytes,
+    /// not text: iTerm2 exports binary property lists.
+    pub themes: BTreeMap<String, Vec<u8>>,
 }
 
 impl Files {
-    /// Reads `config.toml` and `keymap.toml` from `dir`. A missing file is not
-    /// an error. Any other read error is returned as text.
+    /// Reads `config.toml`, `keymap.toml` and the theme files from `dir`. A
+    /// missing file is not an error. Any other read error is returned as text.
     pub fn read(dir: &Path) -> Result<Self, String> {
         Ok(Self {
             config: read_optional(&dir.join("config.toml"))?,
             keymap: read_optional(&dir.join("keymap.toml"))?,
+            themes: read_themes(&dir.join("themes"))?,
         })
     }
 }
@@ -45,6 +52,42 @@ fn read_optional(path: &Path) -> Result<Option<String>, String> {
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("{}: {e}", path.display())),
     }
+}
+
+/// Every theme file in `dir`. A missing directory has no themes.
+fn read_themes(dir: &Path) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(format!("{}: {e}", dir.display())),
+    };
+    let mut themes = BTreeMap::new();
+    for entry in entries {
+        let path = entry.map_err(|e| format!("{}: {e}", dir.display()))?.path();
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if import::theme_name(file_name).is_none() {
+            continue;
+        }
+        let data = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        themes.insert(file_name.to_string(), data);
+    }
+    Ok(themes)
+}
+
+/// The theme names `config.toml` accepts: the built-in themes and the theme
+/// files, in that order.
+pub fn theme_names(files: &Files) -> Vec<String> {
+    let mut names: Vec<String> = theme::NAMES.iter().map(|name| name.to_string()).collect();
+    for file in files.themes.keys() {
+        if let Some(name) = import::theme_name(file) {
+            if !names.iter().any(|known| known == name) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
 }
 
 /// Font settings in `[font]`.
@@ -66,14 +109,38 @@ impl Default for FontConfig {
     }
 }
 
+/// The lowest opacity accepted. Lower values make the text hard to read.
+pub const MIN_OPACITY: f32 = 0.2;
+
+/// Window settings in `[window]`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WindowConfig {
+    /// From `0.2` to `1.0`. Below `1.0` the window shows what is behind it.
+    pub background_opacity: f32,
+    /// Blurs what is behind a see-through window (macOS). Has no effect at `1.0`.
+    pub background_blur: bool,
+}
+
+impl Default for WindowConfig {
+    fn default() -> Self {
+        Self {
+            background_opacity: 1.0,
+            background_blur: false,
+        }
+    }
+}
+
 /// The top-level keys of `config.toml`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub font: FontConfig,
-    /// Name of a built-in theme: `"dark"` or `"light"`.
+    /// A built-in theme (`"dark"` or `"light"`), or the name of a file in
+    /// `themes/` without its extension.
     pub theme: String,
     pub option_as_meta: OptionAsMeta,
+    pub window: WindowConfig,
 }
 
 impl Default for Config {
@@ -82,6 +149,7 @@ impl Default for Config {
             font: FontConfig::default(),
             theme: "dark".into(),
             option_as_meta: OptionAsMeta::default(),
+            window: WindowConfig::default(),
         }
     }
 }
@@ -143,12 +211,13 @@ impl Settings {
             Some(text) => toml::from_str::<Config>(text).map_err(|e| format!("config.toml: {e}"))?,
             None => Config::default(),
         };
-        let theme = theme::by_name(&config.theme).ok_or_else(|| {
-            format!(
-                "config.toml: unknown theme \"{}\" (use \"dark\" or \"light\")",
-                config.theme
-            )
-        })?;
+        let opacity = config.window.background_opacity;
+        if !(MIN_OPACITY..=1.0).contains(&opacity) {
+            return Err(format!(
+                "config.toml: window.background_opacity must be from {MIN_OPACITY} to 1.0, not {opacity}"
+            ));
+        }
+        let theme = resolve_theme(&config.theme, &files.themes)?;
         let user = match &files.keymap {
             Some(text) => keymap::parse(text).map_err(|e| format!("keymap.toml: {e}"))?,
             None => Vec::new(),
@@ -161,6 +230,23 @@ impl Settings {
     }
 }
 
+/// The theme named in `config.toml`: a theme file in `themes/` wins over a
+/// built-in with the same name.
+fn resolve_theme(name: &str, themes: &BTreeMap<String, Vec<u8>>) -> Result<Theme, String> {
+    for (file, data) in themes {
+        if import::theme_name(file) == Some(name) {
+            let scheme = import::parse(file, data).map_err(|e| format!("themes/{file}: {e}"))?;
+            return Ok(scheme.into_theme(name));
+        }
+    }
+    theme::by_name(name).ok_or_else(|| {
+        format!(
+            "config.toml: unknown theme \"{name}\" (use one of: {})",
+            theme::NAMES.join(", ")
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,9 +254,16 @@ mod tests {
     fn parse(config: Option<&str>) -> Result<Settings, String> {
         let files = Files {
             config: config.map(str::to_string),
-            keymap: None,
+            ..Files::default()
         };
         Settings::parse(&files, &[])
+    }
+
+    fn with_theme_file(file: &str, text: &str) -> Files {
+        Files {
+            themes: BTreeMap::from([(file.to_string(), text.as_bytes().to_vec())]),
+            ..Files::default()
+        }
     }
 
     #[test]
@@ -227,5 +320,67 @@ mod tests {
     fn light_theme_is_selected_by_name() {
         let settings = parse(Some("theme = \"light\"\n")).unwrap();
         assert_eq!(settings.theme.name, "light");
+    }
+
+    #[test]
+    fn window_defaults_are_opaque_and_unblurred() {
+        let settings = parse(None).unwrap();
+        assert_eq!(settings.config.window, WindowConfig::default());
+        assert_eq!(settings.config.window.background_opacity, 1.0);
+        assert!(!settings.config.window.background_blur);
+    }
+
+    #[test]
+    fn window_opacity_must_be_in_range() {
+        let error = parse(Some("[window]\nbackground_opacity = 0.05\n")).unwrap_err();
+        assert!(error.contains("background_opacity must be from 0.2 to 1.0"), "{error}");
+        let error = parse(Some("[window]\nbackground_opacity = 1.5\n")).unwrap_err();
+        assert!(error.contains("background_opacity"), "{error}");
+        let settings = parse(Some("[window]\nbackground_opacity = 0.85\nbackground_blur = true\n")).unwrap();
+        assert_eq!(settings.config.window.background_opacity, 0.85);
+        assert!(settings.config.window.background_blur);
+    }
+
+    #[test]
+    fn a_theme_file_is_selected_by_its_name() {
+        let itermcolors = "<plist><dict>\
+            <key>Background Color</key><dict>\
+              <key>Red Component</key><real>0</real>\
+              <key>Green Component</key><real>0</real>\
+              <key>Blue Component</key><real>1</real></dict>\
+            </dict></plist>";
+        let files = Files {
+            config: Some("theme = \"ocean\"\n".into()),
+            ..with_theme_file("ocean.itermcolors", itermcolors)
+        };
+        // The file is missing the foreground and the ANSI entries, so it fails.
+        let error = Settings::parse(&files, &[]).unwrap_err();
+        assert!(error.starts_with("themes/ocean.itermcolors:"), "{error}");
+    }
+
+    #[test]
+    fn a_theme_file_with_the_same_name_as_a_builtin_wins() {
+        let base16 = (0..16)
+            .map(|index| format!("base{index:02X}: \"{:06x}\"\n", index * 0x010101))
+            .collect::<String>();
+        let files = Files {
+            config: Some("theme = \"light\"\n".into()),
+            ..with_theme_file("light.yaml", &base16)
+        };
+        let settings = Settings::parse(&files, &[]).unwrap();
+        assert_eq!(settings.theme.background, Rgb(0));
+    }
+
+    #[test]
+    fn theme_names_list_builtins_then_files() {
+        let files = with_theme_file("nord.yaml", "");
+        assert_eq!(theme_names(&files), ["dark", "light", "nord"]);
+        assert_eq!(theme_names(&Files::default()), ["dark", "light"]);
+    }
+
+    #[test]
+    fn unknown_theme_lists_the_builtins() {
+        let error = parse(Some("theme = \"solarized\"\n")).unwrap_err();
+        assert!(error.contains("(use one of: dark, light)"), "{error}");
     }
 }
