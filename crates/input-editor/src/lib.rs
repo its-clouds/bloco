@@ -1,11 +1,13 @@
 //! The input editor at the prompt: a multi-line text buffer with undo, shell
-//! history and syntax highlighting. No UI code here. The app crate draws the
-//! buffer and turns keys into calls on it.
+//! history, syntax highlighting and completion. No UI code here. The app crate
+//! draws the buffer and turns keys into calls on it.
 
 mod buffer;
+pub mod completion;
 mod highlight;
 mod history;
 mod layout;
+pub mod zsh;
 
 pub use buffer::Buffer;
 pub use highlight::{highlight, Kind, Span};

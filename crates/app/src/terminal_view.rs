@@ -17,8 +17,9 @@ use gpui::{
     AnyElement, App, Bounds, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
     InputHandler, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, Point, Render, ScrollEvent, SharedString, Task, UTF16Selection, Window,
-    div, prelude::*, px, relative,
+    anchored, deferred, div, prelude::*, px, relative,
 };
+use input_editor::completion::{Completion, Item};
 use input_editor::{Buffer, HistorySearch, wrap};
 use term_session::{Block, FindQuery, Link, Row, SelectionKind, Session, SessionEvent, TermMode};
 
@@ -30,11 +31,12 @@ use crate::commands::{
     TextDeleteToLineStart, TextDeleteWordBack, TextLineEnd, TextLineStart, TextWordBack,
     TextWordForward,
 };
+use crate::completion;
 use crate::find::{FindState, Pick};
 use crate::keys::{TextEdit, text_edit_bytes, text_edit_for, to_esc_str};
 use crate::mouse::{alt_scroll, mouse_button_report, mouse_moved_report, scroll_report};
 use crate::option_key::option_keys_down;
-use crate::prompt::{PromptState, is_text_input, submit_bytes};
+use crate::prompt::{self, Menu, PromptState, is_text_input, submit_bytes};
 use crate::terminal_element::{Metrics, TerminalElement, cell_metrics, grid_size};
 
 /// What a pane tells its workspace.
@@ -116,6 +118,8 @@ pub struct TerminalView {
     selected_block: Cell<Option<u64>>,
     /// The input editor at the prompt. It is used while the shell is at its prompt.
     prompt: PromptState,
+    /// The completion lookup in flight. Replaced by the next Tab.
+    completion_task: Option<Task<()>>,
 }
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
@@ -163,6 +167,7 @@ impl TerminalView {
             blink_task: None,
             bell_on: false,
             bell_task: None,
+            completion_task: None,
             layout: Rc::new(RefCell::new(Vec::new())),
             selected_block: Cell::new(None),
             prompt: PromptState::new(),
@@ -1016,6 +1021,9 @@ impl TerminalView {
     /// arrives through the input handler), keys bound to edit actions, and Cmd
     /// shortcuts other than undo and redo.
     fn prompt_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.prompt.menu.is_some() && self.menu_key(event, cx) {
+            return true;
+        }
         let keystroke = &event.keystroke;
         let modifiers = keystroke.modifiers;
         let key = keystroke.key.as_ref();
@@ -1054,6 +1062,8 @@ impl TerminalView {
             "escape" => self.selected_block.set(None),
             // Shift+PageUp and Shift+PageDown scroll the pane, as they do everywhere.
             "pageup" | "pagedown" if modifiers.shift => return false,
+            "tab" if modifiers.shift => {}
+            "tab" => self.start_completion(cx),
             _ if modifiers.control => self.control_key(key),
             // Other keys (function keys, Tab until completion lands) are not sent to
             // the shell: its line editor is not in use while this one is.
@@ -1150,6 +1160,7 @@ impl TerminalView {
     /// history, so the next Up starts again from the edited line.
     fn edit_buffer(&mut self, edit: impl FnOnce(&mut Buffer)) {
         self.prompt.walk.reset();
+        self.prompt.menu = None;
         edit(&mut self.prompt.buffer);
     }
 
@@ -1171,8 +1182,153 @@ impl TerminalView {
         let bracketed = self.session.mode().contains(TermMode::BRACKETED_PASTE);
         let text = self.prompt.buffer.take();
         self.prompt.walk.reset();
+        self.prompt.menu = None;
         self.prompt.history.push(&text);
         self.send_input(&submit_bytes(&text, bracketed));
+    }
+
+    /// Keys while the completion menu is open. Tab and the arrows move the
+    /// selection, Enter accepts it and Escape closes it. Any other key closes the
+    /// menu and is handled as it would be without one (returns false).
+    fn menu_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let shift = event.keystroke.modifiers.shift;
+        let key = event.keystroke.key.as_ref();
+        match key {
+            "tab" | "down" | "up" => {
+                let forward = !(key == "up" || (key == "tab" && shift));
+                if let Some(menu) = self.prompt.menu.as_mut() {
+                    if forward {
+                        menu.next();
+                    } else {
+                        menu.previous();
+                    }
+                }
+            }
+            "enter" if !shift => self.accept_completion(),
+            "escape" => self.prompt.menu = None,
+            _ => {
+                self.prompt.menu = None;
+                return false;
+            }
+        }
+        Self::consumed(cx)
+    }
+
+    /// Looks up the candidates for the word before the cursor, off the UI thread.
+    /// The result is applied only if the line has not changed since.
+    fn start_completion(&mut self, cx: &mut Context<Self>) {
+        if self.prompt.search.is_some() {
+            return;
+        }
+        let before = self.prompt.buffer.before_cursor();
+        let request = before.clone();
+        let cwd = self.session.cwd();
+        let specs = self.prompt.specs.clone();
+        self.completion_task = Some(cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_spawn(
+                    async move { completion::complete(&request, cwd.as_deref(), &specs) },
+                )
+                .await;
+            let _ = this.update(cx, |view, cx| view.finish_completion(&before, found, cx));
+        }));
+    }
+
+    /// Applies the candidates of a lookup. One candidate is inserted; several
+    /// open the menu.
+    fn finish_completion(&mut self, before: &str, found: Completion, cx: &mut Context<Self>) {
+        if self.prompt.buffer.before_cursor() != before
+            || self.prompt.search.is_some()
+            || !self.owns_input()
+        {
+            return;
+        }
+        let Completion { start, items } = found;
+        if items.len() == 1 {
+            self.insert_completion(start, &items[0]);
+        } else if !items.is_empty() {
+            self.prompt.menu = Some(Menu::new(start, items));
+        }
+        cx.notify();
+    }
+
+    /// Accepts the selected candidate of the open menu.
+    fn accept_completion(&mut self) {
+        let Some(menu) = self.prompt.menu.take() else {
+            return;
+        };
+        if let Some(item) = menu.items.get(menu.selected) {
+            self.insert_completion(menu.start, item);
+        }
+    }
+
+    /// Replaces the word from `start` to the cursor with the candidate.
+    fn insert_completion(&mut self, start: usize, item: &Item) {
+        let typed = self.prompt.buffer.cursor().saturating_sub(start);
+        let text = item.inserted();
+        self.edit_buffer(|buffer| buffer.replace_before(typed, &text));
+    }
+
+    /// The completion menu, under the editor's cursor. Drawn while the editor
+    /// owns the keys and the menu is open.
+    fn render_completion_menu(&self) -> Option<AnyElement> {
+        let menu = self.prompt.menu.as_ref()?;
+        if !self.owns_input() {
+            return None;
+        }
+        let origin = self.prompt.origin.get()?;
+        let metrics = self.metrics.get();
+        let buffer = &self.prompt.buffer;
+        let (line, column) =
+            prompt::cursor_cell(origin, &buffer.text(), buffer.cursor(), metrics.columns);
+        // The menu opens on the row below the cursor.
+        let anchor = metrics.cell_bounds(line + 1, column, 1).origin;
+        let chrome = &self.palette.chrome;
+        let rows = menu.visible().map(|index| {
+            let item = &menu.items[index];
+            let selected = index == menu.selected;
+            div()
+                .id(("completion", index))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_4()
+                .px_2()
+                .when(selected, |d| {
+                    d.bg(chrome.selected).text_color(chrome.accent)
+                })
+                .child(div().flex_shrink_0().child(item.text.clone()))
+                .child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_color(chrome.muted)
+                        .child(item.description.clone()),
+                )
+        });
+        Some(
+            deferred(
+                anchored().position(anchor).snap_to_window().child(
+                    div()
+                        .id("completion-menu")
+                        .flex()
+                        .flex_col()
+                        .min_w(px(220.))
+                        .max_w(px(480.))
+                        .py_1()
+                        .text_sm()
+                        .bg(chrome.overlay)
+                        .text_color(chrome.text)
+                        .border_1()
+                        .border_color(chrome.divider)
+                        .rounded_md()
+                        .children(rows),
+                ),
+            )
+            .priority(1)
+            .into_any_element(),
+        )
     }
 
     /// Moves the editor's cursor to a click on the editor. Returns false when the
@@ -1287,6 +1443,7 @@ impl Render for TerminalView {
                 editor_origin: self.prompt.origin.clone(),
             })
             .children(find_bar)
+            .children(self.render_completion_menu())
     }
 }
 

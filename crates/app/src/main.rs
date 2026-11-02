@@ -4,6 +4,7 @@
 mod block_header;
 mod colors;
 mod commands;
+mod completion;
 mod find;
 mod prompt;
 mod keys;

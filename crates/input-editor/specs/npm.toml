@@ -1,0 +1,178 @@
+# Completion spec for npm. The commonly used commands and their flags. Data only.
+name = "npm"
+description = "Node.js package manager"
+
+[[option]]
+name = "--help"
+description = "Print usage"
+
+[[option]]
+name = "--version"
+description = "Print the npm version"
+
+[[subcommand]]
+name = "install"
+description = "Install a package, or all dependencies"
+
+[[subcommand.option]]
+name = "--save-dev"
+description = "Save as a devDependency"
+
+[[subcommand.option]]
+name = "-D"
+description = "Save as a devDependency"
+
+[[subcommand.option]]
+name = "--save-exact"
+description = "Save the exact version"
+
+[[subcommand.option]]
+name = "-E"
+description = "Save the exact version"
+
+[[subcommand.option]]
+name = "--global"
+description = "Install globally"
+
+[[subcommand.option]]
+name = "-g"
+description = "Install globally"
+
+[[subcommand.option]]
+name = "--legacy-peer-deps"
+description = "Ignore peer dependency conflicts"
+
+[[subcommand.option]]
+name = "--omit"
+description = "Skip dev or optional dependencies"
+takes_value = true
+
+[[subcommand]]
+name = "uninstall"
+description = "Remove a package"
+
+[[subcommand.option]]
+name = "--global"
+description = "Remove the global package"
+
+[[subcommand]]
+name = "run"
+description = "Run a script from package.json"
+
+[[subcommand.option]]
+name = "--if-present"
+description = "Do not fail if the script is missing"
+
+[[subcommand]]
+name = "start"
+description = "Run the start script"
+
+[[subcommand]]
+name = "test"
+description = "Run the test script"
+
+[[subcommand]]
+name = "init"
+description = "Create a package.json"
+
+[[subcommand.option]]
+name = "-y"
+description = "Accept all defaults"
+
+[[subcommand]]
+name = "update"
+description = "Update packages"
+
+[[subcommand.option]]
+name = "--global"
+description = "Update global packages"
+
+[[subcommand]]
+name = "outdated"
+description = "Check for outdated packages"
+
+[[subcommand]]
+name = "list"
+description = "List installed packages"
+
+[[subcommand.option]]
+name = "--global"
+description = "List global packages"
+
+[[subcommand.option]]
+name = "--depth"
+description = "Max depth of the tree"
+takes_value = true
+
+[[subcommand]]
+name = "ls"
+description = "List installed packages"
+
+[[subcommand]]
+name = "ci"
+description = "Clean install from package-lock.json"
+
+[[subcommand]]
+name = "audit"
+description = "Run a security audit"
+
+[[subcommand.subcommand]]
+name = "fix"
+description = "Fix vulnerabilities where possible"
+
+[[subcommand]]
+name = "publish"
+description = "Publish a package to the registry"
+
+[[subcommand.option]]
+name = "--access"
+description = "public or restricted"
+takes_value = true
+
+[[subcommand.option]]
+name = "--dry-run"
+description = "Show what would be published"
+
+[[subcommand]]
+name = "link"
+description = "Symlink a package folder"
+
+[[subcommand]]
+name = "exec"
+description = "Run a command from a package"
+
+[[subcommand]]
+name = "config"
+description = "Manage the npm configuration"
+
+[[subcommand.subcommand]]
+name = "get"
+description = "Get a config value"
+
+[[subcommand.subcommand]]
+name = "set"
+description = "Set a config value"
+
+[[subcommand.subcommand]]
+name = "list"
+description = "List all config values"
+
+[[subcommand]]
+name = "cache"
+description = "Manage the package cache"
+
+[[subcommand.subcommand]]
+name = "clean"
+description = "Clean the cache"
+
+[[subcommand]]
+name = "view"
+description = "View registry info of a package"
+
+[[subcommand]]
+name = "search"
+description = "Search the registry"
+
+[[subcommand]]
+name = "help"
+description = "Get help on npm"

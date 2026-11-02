@@ -1,0 +1,231 @@
+# Completion spec for kubectl. The commonly used commands and their flags. Data only.
+name = "kubectl"
+description = "Control the Kubernetes cluster manager"
+
+[[option]]
+name = "-n"
+description = "Namespace to use"
+takes_value = true
+
+[[option]]
+name = "--namespace"
+description = "Namespace to use"
+takes_value = true
+
+[[option]]
+name = "--context"
+description = "Kubeconfig context to use"
+takes_value = true
+
+[[option]]
+name = "-A"
+description = "Use all namespaces"
+
+[[option]]
+name = "--kubeconfig"
+description = "Path to the kubeconfig file"
+takes_value = true
+
+[[option]]
+name = "-o"
+description = "Output format (json, yaml, wide, name)"
+takes_value = true
+
+[[option]]
+name = "--help"
+description = "Print usage"
+
+[[subcommand]]
+name = "get"
+description = "Display one or many resources"
+
+[[subcommand.option]]
+name = "-o"
+description = "Output format (json, yaml, wide, name)"
+takes_value = true
+
+[[subcommand.option]]
+name = "-l"
+description = "Filter by label selector"
+takes_value = true
+
+[[subcommand.option]]
+name = "-w"
+description = "Watch for changes"
+
+[[subcommand.option]]
+name = "--show-labels"
+description = "Show the labels column"
+
+[[subcommand]]
+name = "describe"
+description = "Show details of a specific resource"
+
+[[subcommand]]
+name = "create"
+description = "Create a resource from a file or stdin"
+
+[[subcommand.option]]
+name = "-f"
+description = "File or directory with the manifest"
+takes_value = true
+
+[[subcommand]]
+name = "apply"
+description = "Apply a configuration to a resource"
+
+[[subcommand.option]]
+name = "-f"
+description = "File or directory with the manifest"
+takes_value = true
+
+[[subcommand.option]]
+name = "-k"
+description = "Apply a kustomization directory"
+takes_value = true
+
+[[subcommand.option]]
+name = "--dry-run"
+description = "Client or server dry run, no changes made"
+takes_value = true
+
+[[subcommand]]
+name = "delete"
+description = "Delete resources"
+
+[[subcommand.option]]
+name = "-f"
+description = "File with the manifest to delete"
+takes_value = true
+
+[[subcommand.option]]
+name = "--force"
+description = "Delete immediately without a grace period"
+
+[[subcommand]]
+name = "edit"
+description = "Edit a resource in the default editor"
+
+[[subcommand]]
+name = "logs"
+description = "Print the logs of a container in a pod"
+
+[[subcommand.option]]
+name = "-f"
+description = "Follow the log output"
+
+[[subcommand.option]]
+name = "-c"
+description = "Container name"
+takes_value = true
+
+[[subcommand.option]]
+name = "--tail"
+description = "Lines of recent logs to show"
+takes_value = true
+
+[[subcommand.option]]
+name = "--previous"
+description = "Logs of the previous container instance"
+
+[[subcommand]]
+name = "exec"
+description = "Run a command in a container"
+
+[[subcommand.option]]
+name = "-i"
+description = "Keep STDIN open"
+
+[[subcommand.option]]
+name = "-t"
+description = "Allocate a TTY"
+
+[[subcommand.option]]
+name = "-c"
+description = "Container name"
+takes_value = true
+
+[[subcommand]]
+name = "port-forward"
+description = "Forward local ports to a pod or service"
+
+[[subcommand]]
+name = "rollout"
+description = "Manage the rollout of a resource"
+
+[[subcommand.subcommand]]
+name = "status"
+description = "Watch the rollout status"
+
+[[subcommand.subcommand]]
+name = "restart"
+description = "Restart a resource"
+
+[[subcommand.subcommand]]
+name = "undo"
+description = "Roll back to a previous revision"
+
+[[subcommand.subcommand]]
+name = "history"
+description = "View the rollout history"
+
+[[subcommand]]
+name = "scale"
+description = "Set the number of replicas"
+
+[[subcommand.option]]
+name = "--replicas"
+description = "Number of replicas"
+takes_value = true
+
+[[subcommand]]
+name = "config"
+description = "Modify kubeconfig files"
+
+[[subcommand.subcommand]]
+name = "view"
+description = "Display the kubeconfig"
+
+[[subcommand.subcommand]]
+name = "get-contexts"
+description = "Describe one or many contexts"
+
+[[subcommand.subcommand]]
+name = "use-context"
+description = "Set the current context"
+
+[[subcommand.subcommand]]
+name = "current-context"
+description = "Display the current context"
+
+[[subcommand.subcommand]]
+name = "set-context"
+description = "Set a context entry"
+
+[[subcommand]]
+name = "top"
+description = "Show resource usage of nodes or pods"
+
+[[subcommand]]
+name = "explain"
+description = "Documentation of a resource"
+
+[[subcommand]]
+name = "version"
+description = "Print the client and server version"
+
+[[subcommand]]
+name = "cluster-info"
+description = "Display cluster information"
+
+[[subcommand]]
+name = "api-resources"
+description = "Print the supported API resources"
+
+[[subcommand]]
+name = "auth"
+description = "Inspect authorization"
+
+[[subcommand.subcommand]]
+name = "can-i"
+description = "Check whether an action is allowed"

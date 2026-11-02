@@ -1,0 +1,328 @@
+# Completion spec for cargo. The commonly used subcommands and their flags. Data only.
+name = "cargo"
+description = "Rust's package manager"
+
+[[option]]
+name = "--version"
+description = "Print the cargo version"
+
+[[option]]
+name = "-V"
+description = "Print the cargo version"
+
+[[option]]
+name = "--help"
+description = "Print usage"
+
+[[option]]
+name = "-q"
+description = "Do not print cargo log messages"
+
+[[option]]
+name = "--quiet"
+description = "Do not print cargo log messages"
+
+[[option]]
+name = "-v"
+description = "Use verbose output"
+
+[[option]]
+name = "--verbose"
+description = "Use verbose output"
+
+[[subcommand]]
+name = "build"
+description = "Compile the current package"
+
+[[subcommand.option]]
+name = "--release"
+description = "Build with optimizations"
+
+[[subcommand.option]]
+name = "-p"
+description = "Build only this package"
+takes_value = true
+
+[[subcommand.option]]
+name = "--package"
+description = "Build only this package"
+takes_value = true
+
+[[subcommand.option]]
+name = "--workspace"
+description = "Build all workspace members"
+
+[[subcommand.option]]
+name = "--all-targets"
+description = "Build all targets (lib, bins, tests, benches, examples)"
+
+[[subcommand.option]]
+name = "--target"
+description = "Build for this target triple"
+takes_value = true
+
+[[subcommand.option]]
+name = "--features"
+description = "Space or comma separated list of features"
+takes_value = true
+
+[[subcommand.option]]
+name = "--all-features"
+description = "Activate all features"
+
+[[subcommand.option]]
+name = "--no-default-features"
+description = "Do not activate the default features"
+
+[[subcommand]]
+name = "run"
+description = "Run a binary or example of the local package"
+
+[[subcommand.option]]
+name = "--release"
+description = "Run with optimizations"
+
+[[subcommand.option]]
+name = "-p"
+description = "Run the binary of this package"
+takes_value = true
+
+[[subcommand.option]]
+name = "--bin"
+description = "Run this binary"
+takes_value = true
+
+[[subcommand.option]]
+name = "--example"
+description = "Run this example"
+takes_value = true
+
+[[subcommand.option]]
+name = "--features"
+description = "Space or comma separated list of features"
+takes_value = true
+
+[[subcommand]]
+name = "test"
+description = "Run the tests"
+
+[[subcommand.option]]
+name = "--release"
+description = "Test with optimizations"
+
+[[subcommand.option]]
+name = "-p"
+description = "Test only this package"
+takes_value = true
+
+[[subcommand.option]]
+name = "--workspace"
+description = "Test all workspace members"
+
+[[subcommand.option]]
+name = "--no-run"
+description = "Compile but do not run the tests"
+
+[[subcommand.option]]
+name = "--all-targets"
+description = "Test all targets"
+
+[[subcommand.option]]
+name = "--features"
+description = "Space or comma separated list of features"
+takes_value = true
+
+[[subcommand]]
+name = "check"
+description = "Check the package for errors without building"
+
+[[subcommand.option]]
+name = "--release"
+description = "Check with optimizations"
+
+[[subcommand.option]]
+name = "-p"
+description = "Check only this package"
+takes_value = true
+
+[[subcommand.option]]
+name = "--workspace"
+description = "Check all workspace members"
+
+[[subcommand.option]]
+name = "--all-targets"
+description = "Check all targets"
+
+[[subcommand]]
+name = "clippy"
+description = "Run the Clippy lints"
+
+[[subcommand.option]]
+name = "--fix"
+description = "Apply the suggested fixes"
+
+[[subcommand.option]]
+name = "--workspace"
+description = "Lint all workspace members"
+
+[[subcommand.option]]
+name = "--all-targets"
+description = "Lint all targets"
+
+[[subcommand.option]]
+name = "-p"
+description = "Lint only this package"
+takes_value = true
+
+[[subcommand]]
+name = "fmt"
+description = "Format all bin and lib files of the package"
+
+[[subcommand.option]]
+name = "--all"
+description = "Format all workspace members"
+
+[[subcommand.option]]
+name = "--check"
+description = "Run in check mode without writing files"
+
+[[subcommand]]
+name = "doc"
+description = "Build the documentation"
+
+[[subcommand.option]]
+name = "--open"
+description = "Open the docs in a browser"
+
+[[subcommand.option]]
+name = "--no-deps"
+description = "Do not build the docs of dependencies"
+
+[[subcommand]]
+name = "new"
+description = "Create a new package in a new directory"
+
+[[subcommand.option]]
+name = "--bin"
+description = "Create a binary package"
+
+[[subcommand.option]]
+name = "--lib"
+description = "Create a library package"
+
+[[subcommand.option]]
+name = "--name"
+description = "Set the package name"
+takes_value = true
+
+[[subcommand]]
+name = "init"
+description = "Create a new package in the current directory"
+
+[[subcommand.option]]
+name = "--bin"
+description = "Create a binary package"
+
+[[subcommand.option]]
+name = "--lib"
+description = "Create a library package"
+
+[[subcommand]]
+name = "add"
+description = "Add dependencies to Cargo.toml"
+
+[[subcommand.option]]
+name = "--dev"
+description = "Add as a development dependency"
+
+[[subcommand.option]]
+name = "--build"
+description = "Add as a build dependency"
+
+[[subcommand.option]]
+name = "--features"
+description = "Space or comma separated list of features"
+takes_value = true
+
+[[subcommand.option]]
+name = "--optional"
+description = "Mark the dependency as optional"
+
+[[subcommand]]
+name = "remove"
+description = "Remove dependencies from Cargo.toml"
+
+[[subcommand.option]]
+name = "--dev"
+description = "Remove a development dependency"
+
+[[subcommand]]
+name = "update"
+description = "Update dependencies in Cargo.lock"
+
+[[subcommand.option]]
+name = "-p"
+description = "Update only this package"
+takes_value = true
+
+[[subcommand.option]]
+name = "--dry-run"
+description = "Show what would be updated"
+
+[[subcommand]]
+name = "install"
+description = "Build and install a binary"
+
+[[subcommand.option]]
+name = "--path"
+description = "Install from this local path"
+takes_value = true
+
+[[subcommand.option]]
+name = "--locked"
+description = "Require Cargo.lock to be up to date"
+
+[[subcommand.option]]
+name = "--force"
+description = "Overwrite an existing installed binary"
+
+[[subcommand]]
+name = "clean"
+description = "Remove the target directory"
+
+[[subcommand.option]]
+name = "--release"
+description = "Remove only the release artifacts"
+
+[[subcommand]]
+name = "tree"
+description = "Display the dependency tree"
+
+[[subcommand.option]]
+name = "-i"
+description = "Invert the tree on this package"
+takes_value = true
+
+[[subcommand.option]]
+name = "-d"
+description = "Show only duplicate dependencies"
+
+[[subcommand]]
+name = "search"
+description = "Search registry for crates"
+
+[[subcommand]]
+name = "publish"
+description = "Upload a package to the registry"
+
+[[subcommand.option]]
+name = "--dry-run"
+description = "Perform all checks without uploading"
+
+[[subcommand]]
+name = "bench"
+description = "Run the benchmarks"
+
+[[subcommand]]
+name = "metadata"
+description = "Output the resolved dependencies as JSON"

@@ -87,6 +87,20 @@ impl Buffer {
         self.cursor = index.min(self.text.len());
     }
 
+    /// The text before the cursor. Completion looks at this.
+    pub fn before_cursor(&self) -> String {
+        self.text[..self.cursor].iter().collect()
+    }
+
+    /// Replaces the `count` chars before the cursor with `text`, and puts the
+    /// cursor after it. Accepting a completion does this to the partial word.
+    pub fn replace_before(&mut self, count: usize, text: &str) {
+        self.edit(Last::Other);
+        let start = self.cursor.saturating_sub(count);
+        self.text.splice(start..self.cursor, text.chars());
+        self.cursor = start + text.chars().count();
+    }
+
     pub fn is_first_line(&self) -> bool {
         !self.text[..self.cursor].contains(&'\n')
     }

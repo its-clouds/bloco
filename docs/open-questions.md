@@ -56,6 +56,31 @@ When the editor owns the input, whose prompt is displayed?
   MIT-licensed Fig autocomplete specs, after verifying the license and that
   they are maintained).
 
+> **Accepted (M5, 2026-11-02).** Built on this branch.
+>
+> - **Format: TOML data, one file per command, no code.** A spec has a `name`,
+>   a `description`, `option` tables (with `takes_value`) and `subcommand`
+>   tables, nested for two levels (`git remote add`). Options of a parent apply
+>   below it. Generators (for example "list branches") are not in v1: a word the
+>   spec does not cover goes to the shell instead. WASM generators wait for the
+>   plugin API (open question 5).
+> - **Where specs live:** in the repo at `crates/input-editor/specs/*.toml`,
+>   compiled in with `include_str!`. A user directory (`~/.config/bloco/completions/`)
+>   that overrides them by command name is the next step, not in M5.
+> - **Source:** written by hand for git, docker, kubectl, cargo and npm, covering
+>   the subcommands and flags used most. The Fig specs are not converted yet: the
+>   license and upkeep still need checking.
+> - **Order:** the spec answers first. Then, for a word it does not cover, zsh's
+>   own completion (below). Then file names in the shell's directory.
+> - **zsh fallback:** Bloco starts `zsh -f` in a pseudo-terminal (`zpty`), types
+>   the line and Tab, and reads the candidates from a wrapped `compadd`, so
+>   nothing is drawn by zsh. It takes about 0.3 s and has a 3 s timeout. It runs
+>   with `-f`, so the user's `~/.zshrc`, fpath and plugins are not loaded: their
+>   extra completions (oh-my-zsh, Homebrew) are missing. Loading the user's rc
+>   is slower and runs their code on each Tab, so it is a later choice. File names
+>   are listed in Rust, because zsh's file candidates need its own line editor.
+>   Paths (words with `/`, `~` or `.`) skip zsh.
+
 ## 5. Plugin licensing
 
 Core is GPL-3.0. Do plugins that talk to the host through the WIT interface
