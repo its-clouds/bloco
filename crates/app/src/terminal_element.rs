@@ -15,8 +15,9 @@ use std::sync::Arc;
 use gpui::{
     App, Bounds, BorderStyle, CursorStyle, Element, ElementId, Entity, FocusHandle, Font,
     FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId,
-    IntoElement, LayoutId, Pixels, Point, ShapedLine, SharedString, Style, StrikethroughStyle,
-    TextAlign, TextRun, UnderlineStyle, Window, fill, outline, point, px, relative, size,
+    IntoElement, LayoutId, Pixels, Point, ShapedLine, SharedString, Size, Style,
+    StrikethroughStyle, TextAlign, TextRun, UnderlineStyle, Window, fill, outline, point, px,
+    relative, size,
 };
 use term_session::{CursorShape, FindMatch, Flags, Session, Side, SnapshotCell};
 
@@ -34,6 +35,8 @@ pub const LINE_HEIGHT: f32 = 1.3;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Metrics {
     pub origin: Point<Pixels>,
+    /// The pane's size in pixels. A font change resizes the grid to fit it.
+    pub size: Size<Pixels>,
     pub cell_width: Pixels,
     pub line_height: Pixels,
     pub columns: usize,
@@ -85,6 +88,10 @@ pub struct TerminalElement {
     pub hovered_link: Option<(usize, usize, usize)>,
     /// Find matches to highlight (oldest first), and the index of the current one.
     pub find: Option<(Rc<[FindMatch]>, Option<usize>)>,
+    /// Whether the cursor is in the shown half of its blink.
+    pub cursor_on: bool,
+    /// The visual bell is flashing: the pane is tinted.
+    pub bell: bool,
 }
 
 /// What `prepaint` decided to draw. `paint` only issues the draw calls.
@@ -160,20 +167,15 @@ impl Element for TerminalElement {
         bounds: Bounds<Pixels>,
         _request_layout: &mut (),
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> Prepaint {
-        let cell_width = self.cell_width(window);
-        let line_height = px((f32::from(self.font_size) * LINE_HEIGHT).round());
+        let (cell_width, line_height) = cell_metrics(cx, &self.font_family, self.font_size);
         let padding = px(PADDING);
-        let columns = ((f32::from(bounds.size.width) - 2.0 * PADDING) / f32::from(cell_width))
-            .floor()
-            .clamp(2.0, 10_000.0) as usize;
-        let rows = ((f32::from(bounds.size.height) - 2.0 * PADDING) / f32::from(line_height))
-            .floor()
-            .clamp(1.0, 10_000.0) as usize;
+        let (columns, rows) = grid_size(bounds.size, cell_width, line_height);
 
         let metrics = Metrics {
             origin: bounds.origin + point(padding, padding),
+            size: bounds.size,
             cell_width,
             line_height,
             columns,
@@ -207,7 +209,8 @@ impl Element for TerminalElement {
             }
             _ => None,
         };
-        let block_cursor = self.focused && cursor_on_screen && cursor.shape == CursorShape::Block;
+        let block_cursor =
+            self.focused && cursor_on_screen && self.cursor_on && cursor.shape == CursorShape::Block;
         let found = match &self.find {
             Some((matches, current)) => visible_spans(
                 matches,
@@ -247,8 +250,11 @@ impl Element for TerminalElement {
         if cursor_on_screen {
             let cell = metrics.cell_bounds(cursor.line, cursor.column, 1);
             prepaint.ime_bounds = Some(cell);
+            // An unfocused cursor stays visible: it is an outline, and does not blink.
             prepaint.cursor = if !self.focused {
                 Some(CursorOverlay::Outline(cell))
+            } else if !self.cursor_on {
+                None
             } else {
                 match cursor.shape {
                     CursorShape::Beam => Some(CursorOverlay::Fill(Bounds::new(
@@ -295,7 +301,7 @@ impl Element for TerminalElement {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _request_layout: &mut (),
         prepaint: &mut Prepaint,
         window: &mut Window,
@@ -333,6 +339,10 @@ impl Element for TerminalElement {
             }
             None => {}
         }
+        // The bell is drawn last, over the text, so it is visible on any output.
+        if self.bell {
+            window.paint_quad(fill(bounds, self.palette.foreground.opacity(0.15)));
+        }
     }
 }
 
@@ -344,21 +354,31 @@ impl IntoElement for TerminalElement {
     }
 }
 
-impl TerminalElement {
-    /// The advance of 'm' in the regular face: the width of one cell.
-    fn cell_width(&self, window: &Window) -> Pixels {
-        let font_id = window.text_system().resolve_font(&font_for(
-            &self.font_family,
-            false,
-            false,
-        ));
-        window
-            .text_system()
-            .advance(font_id, self.font_size, 'm')
-            .map(|advance| advance.width)
-            .unwrap_or(px(8.))
-    }
+/// The cell width and line height for a font. The width is the advance of 'm' in
+/// the regular face. Free of the window, so a pane in a hidden tab can use it.
+pub fn cell_metrics(cx: &App, font_family: &SharedString, font_size: Pixels) -> (Pixels, Pixels) {
+    let text_system = cx.text_system();
+    let font_id = text_system.resolve_font(&font_for(font_family, false, false));
+    let cell_width = text_system
+        .advance(font_id, font_size, 'm')
+        .map(|advance| advance.width)
+        .unwrap_or(px(8.));
+    let line_height = px((f32::from(font_size) * LINE_HEIGHT).round());
+    (cell_width, line_height)
+}
 
+/// The columns and rows that fit in `area` (a pane's size), with the padding.
+pub fn grid_size(area: Size<Pixels>, cell_width: Pixels, line_height: Pixels) -> (usize, usize) {
+    let columns = ((f32::from(area.width) - 2.0 * PADDING) / f32::from(cell_width))
+        .floor()
+        .clamp(2.0, 10_000.0) as usize;
+    let rows = ((f32::from(area.height) - 2.0 * PADDING) / f32::from(line_height))
+        .floor()
+        .clamp(1.0, 10_000.0) as usize;
+    (columns, rows)
+}
+
+impl TerminalElement {
     /// Adds the backgrounds and text of one row to `out`.
     #[allow(clippy::too_many_arguments)]
     fn layout_line(

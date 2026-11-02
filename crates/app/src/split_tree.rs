@@ -2,6 +2,8 @@
 //! rectangle in two. This module is geometry only (no GPUI), so the rules have
 //! unit tests. The workspace renders the same numbers with flexbox.
 
+use serde::{Deserialize, Serialize};
+
 /// A rectangle in window pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rect {
@@ -22,7 +24,7 @@ impl Rect {
 }
 
 /// How a split divides its rectangle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Axis {
     /// The two panes sit side by side. Made by a split to the right.
     Horizontal,
@@ -99,6 +101,11 @@ impl<T: Clone + PartialEq> SplitTree<T> {
         Self {
             root: Node::Leaf(pane),
         }
+    }
+
+    /// Wraps a tree built elsewhere, such as one restored from a saved layout.
+    pub fn from_root(root: Node<T>) -> Self {
+        Self { root }
     }
 
     pub fn root(&self) -> &Node<T> {

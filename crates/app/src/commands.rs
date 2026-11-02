@@ -32,6 +32,9 @@ actions!(
         FindNext,
         FindPrevious,
         FindClose,
+        ZoomIn,
+        ZoomOut,
+        ZoomReset,
         QuitApp,
     ]
 );
@@ -81,6 +84,9 @@ pub const COMMANDS: &[Command] = &[
     Command { id: "find.next", title: "Find next", keys: &["cmd-g"] },
     Command { id: "find.previous", title: "Find previous", keys: &["cmd-shift-g"] },
     Command { id: "find.close", title: "Close find bar", keys: &[] },
+    Command { id: "view.zoom_in", title: "Zoom in", keys: &["cmd-=", "cmd-+"] },
+    Command { id: "view.zoom_out", title: "Zoom out", keys: &["cmd--"] },
+    Command { id: "view.zoom_reset", title: "Reset zoom", keys: &["cmd-0"] },
     Command { id: "app.quit", title: "Quit Bloco", keys: &["cmd-q"] },
 ];
 
@@ -111,6 +117,9 @@ pub fn action_for(id: &str) -> Option<Box<dyn Action>> {
         "find.next" => Box::new(FindNext),
         "find.previous" => Box::new(FindPrevious),
         "find.close" => Box::new(FindClose),
+        "view.zoom_in" => Box::new(ZoomIn),
+        "view.zoom_out" => Box::new(ZoomOut),
+        "view.zoom_reset" => Box::new(ZoomReset),
         "app.quit" => Box::new(QuitApp),
         _ => {
             let number: usize = id.strip_prefix("tab.select.")?.parse().ok()?;

@@ -42,6 +42,11 @@ pub enum SessionEvent {
     Title(String),
     /// The shell closed the PTY, usually because it exited.
     Exit,
+    /// The shell sent text for the clipboard with OSC 52. The primary selection
+    /// is written to the same clipboard. Read requests are not answered.
+    Clipboard(String),
+    /// The shell rang the bell (BEL, 0x07).
+    Bell,
 }
 
 pub struct Session {
@@ -80,6 +85,8 @@ impl EventListener for PtyResponder {
                 }
             }
             Event::Title(title) => (self.listener)(SessionEvent::Title(title)),
+            Event::ClipboardStore(_, text) => (self.listener)(SessionEvent::Clipboard(text)),
+            Event::Bell => (self.listener)(SessionEvent::Bell),
             _ => {}
         }
     }
@@ -552,4 +559,46 @@ fn write_zdotdir() -> Result<PathBuf> {
     );
     std::fs::write(dir.join(".zshrc"), rc).context("write .zshrc")?;
     Ok(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Feeds raw PTY bytes through the same parser the reader thread uses, and
+    /// returns the events the listener received.
+    fn events_for(bytes: &[u8]) -> Vec<SessionEvent> {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let listener: Listener = Arc::new(move |event| sink.lock().unwrap().push(event));
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(std::io::sink())));
+        let mut term = Term::new(
+            Config::default(),
+            &TermSize::new(80, 24),
+            PtyResponder { writer, listener },
+        );
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, bytes);
+        let events = events.lock().unwrap().clone();
+        events
+    }
+
+    #[test]
+    fn osc_52_store_reaches_the_listener_as_text() {
+        // "Hello" in base64, ST-terminated.
+        let events = events_for(b"\x1b]52;c;SGVsbG8=\x1b\\");
+        assert_eq!(events, [SessionEvent::Clipboard("Hello".into())]);
+    }
+
+    #[test]
+    fn osc_52_read_request_is_not_answered() {
+        let events = events_for(b"\x1b]52;c;?\x07");
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn bel_reaches_the_listener() {
+        let events = events_for(b"a\x07b\x07");
+        assert_eq!(events, [SessionEvent::Bell, SessionEvent::Bell]);
+    }
 }

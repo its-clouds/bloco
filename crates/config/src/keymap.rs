@@ -80,12 +80,15 @@ pub fn validate_keys(keys: &str) -> Result<(), String> {
         return Err("no keys given".into());
     }
     for stroke in keys.split_whitespace() {
-        let mut pieces: Vec<&str> = stroke.split('-').collect();
-        let key = pieces.pop().unwrap_or_default();
+        let (modifiers, key) = split_keystroke(stroke);
         if key.is_empty() {
             return Err(format!("\"{stroke}\" has no key after the modifiers"));
         }
-        if let Some(bad) = pieces.iter().find(|m| !MODIFIERS.contains(m)) {
+        if let Some(bad) = modifiers
+            .split('-')
+            .filter(|m| !m.is_empty())
+            .find(|m| !MODIFIERS.contains(m))
+        {
             return Err(format!("unknown modifier \"{bad}\" (use ctrl, alt, shift, cmd or fn)"));
         }
     }
@@ -126,8 +129,18 @@ pub fn normalize(keys: &str) -> String {
         .join(" ")
 }
 
+/// Splits a keystroke into its modifiers and its key: `"cmd-shift-t"` gives
+/// `("cmd-shift", "t")`. `"cmd--"` is Cmd+minus, so its key is `"-"`. Splitting
+/// at the last `-` would leave no key.
+fn split_keystroke(stroke: &str) -> (&str, &str) {
+    match stroke.strip_suffix("--") {
+        Some(modifiers) => (modifiers, "-"),
+        None => stroke.rsplit_once('-').unwrap_or(("", stroke)),
+    }
+}
+
 fn normalize_keystroke(stroke: &str) -> String {
-    let (head, key) = stroke.rsplit_once('-').unwrap_or(("", stroke));
+    let (head, key) = split_keystroke(stroke);
     let mut shift = head.split('-').any(|m| m.eq_ignore_ascii_case("shift"));
     let mut key = key.to_string();
     let mut chars = key.chars();
@@ -187,6 +200,13 @@ mod tests {
     }
 
     #[test]
+    fn minus_is_a_key() {
+        assert!(validate_keys("cmd--").is_ok());
+        assert!(validate_keys("cmd-shift--").is_ok());
+        assert!(validate_keys("-").is_err());
+    }
+
+    #[test]
     fn rejects_unknown_fields() {
         assert!(parse("[[bind]]\nkeys = \"cmd-t\"\nact = \"x\"\n").is_err());
     }
@@ -227,6 +247,16 @@ mod tests {
         assert_eq!(normalize("cmd-D"), "shift-cmd-d");
         assert_eq!(normalize("ctrl-alt-left"), "ctrl-alt-left");
         assert_eq!(normalize("cmd-k cmd-t"), "cmd-k cmd-t");
+    }
+
+    #[test]
+    fn minus_is_a_key_not_only_a_separator() {
+        assert_eq!(normalize("cmd--"), "cmd--");
+        assert_eq!(normalize("ctrl-alt--"), "ctrl-alt--");
+        assert_eq!(normalize("cmd-k cmd--"), "cmd-k cmd--");
+        assert!(validate_keys("cmd--").is_ok());
+        let merged = merge(&[binding("cmd--", "view.zoom_out")], &[]);
+        assert_eq!(merged[0].keys, "cmd--");
     }
 
     #[test]

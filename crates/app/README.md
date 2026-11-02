@@ -42,9 +42,18 @@ These are the defaults. `keymap.toml` can change any of them (see below).
 | Find (opens the bar, or selects its query when open) | Cmd+F | `find.open` |
 | Next match (older) / previous match (newer) | Cmd+G / Cmd+Shift+G, or Enter / Shift+Enter in the bar | `find.next`, `find.previous` |
 | Close the find bar | Esc in the bar, or its ×. No key in the terminal (Esc belongs to the shell) | `find.close` |
+| Zoom in (font +1 pt) | Cmd+= or Cmd++ (Cmd+Shift+=) | `view.zoom_in` |
+| Zoom out (font −1 pt) | Cmd+- | `view.zoom_out` |
+| Reset zoom to the size in `config.toml` | Cmd+0 | `view.zoom_reset` |
 | Quit | Cmd+Q | `app.quit` |
 
 Cmd combinations never reach the shell. A Cmd key with no binding does nothing.
+
+Zoom changes the terminal text in every tab and pane, including hidden tabs. Each grid
+is resized to fit the same window, so shells and full-screen apps reflow. The size is
+clamped to 6 to 72 pt. The zoom is kept in memory only: it is not written to
+`config.toml`, and a restart starts at the configured size. A change to `[font] size`
+through hot reload keeps the zoom offset.
 
 The command-line keys send the bytes that the shell's line editor reads: `ESC b` and
 `ESC f` for words, `Ctrl-A` and `Ctrl-E` for the ends of the line, `ESC DEL` and `Ctrl-U`
@@ -66,7 +75,8 @@ its own color (`find_match`, `find_current` and `find_text` in the theme). A sel
 in the terminal (its first line) becomes the query. Without one, the last query comes
 back, selected.
 
-- `.*` makes the query a regular expression (Rust `regex` syntax). An invalid one turns
+- `.*` makes the query a regular expression (Rust `regex` syntax, with `^` and `$` at
+  the ends of each line). An invalid one turns
   the bar red and shows "Invalid regex". `Aa` makes it case-sensitive. Both start off.
 - Matches are counted from the newest output up, as in Warp: `1/163` is the match
   nearest the bottom. Next (Enter, Cmd+G, ↓) goes to older output, previous
@@ -74,7 +84,7 @@ back, selected.
 - Esc or × closes the bar and clears the highlights. The view stays where it is.
 - New output reruns the search at most every 150 ms, on a background thread, and the
   current match stays current. A search over a full scrollback (10,000 lines) takes
-  about 15 ms in a release build.
+  about 10 ms in a release build.
 - At most 10,000 matches are kept, the newest ones. The counter then ends in `+`.
 - In the bar, Option+Backspace deletes a word, Cmd+Backspace clears the query and Cmd+V
   pastes its first line. The other command-line keys do nothing there, and no key in the
@@ -82,7 +92,11 @@ back, selected.
 - Each pane has its own bar and query.
 
 The search itself is `term_session::Finder` (`crates/term-session/src/search.rs`). It
-runs `alacritty_terminal`'s `RegexIter` over the whole buffer, as Zed does.
+reads the buffer one logical line at a time (rows joined where the output wrapped,
+without the blank cells after the text) and runs the `regex` crate on each line. So `^`
+and `$` match at the start and end of a printed line, even one that wrapped.
+`alacritty_terminal`'s own `RegexIter` is not used: it feeds the blank cells to the
+regex, so `$` never matched, and it restarts `^` after each match.
 
 ## Settings
 

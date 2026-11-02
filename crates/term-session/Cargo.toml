@@ -10,5 +10,6 @@ description = "PTY session, VT state and command blocks for Bloco. No UI code."
 alacritty_terminal = "0.25"
 anyhow = "1"
 portable-pty = "0.9"
+regex = "1"
 
 [dev-dependencies]

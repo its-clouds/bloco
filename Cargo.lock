@@ -159,6 +159,7 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "serde",
+ "serde_json",
  "term-session",
  "toml 0.8.23",
 ]
@@ -4754,6 +4755,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "portable-pty",
+ "regex",
 ]
 
 [[package]]

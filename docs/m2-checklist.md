@@ -23,7 +23,7 @@ manual run.
 Status as of this change:
 
 - Build and tests: `cargo build --release` and `cargo test --workspace` pass
-  (config 19, term-session 30, app 40 tests).
+  (config 20, term-session 36, app 47 tests).
 - Launch: the binary and the `.app` bundle start, each with its zsh child, and stay
   up. Killing the shell closes the app.
 - Hot reload: a valid file applies, and an invalid file is logged and keeps the last
@@ -153,8 +153,8 @@ The keys send readline bytes at a shell prompt and xterm keys in full-screen app
 
 ## Find bar
 
-Unit tests cover the search (plain text, case, regex, invalid regex, wrapped lines,
-scrollback, the match limit) and the bar's state (typing, counter, next and previous,
+Unit tests cover the search (plain text, case, regex, `^` and `$` anchors, invalid
+regex, wrapped lines, wide characters and emoji, scrollback, the match limit) and the bar's state (typing, counter, next and previous,
 keeping the current match). Everything you see or type is pending.
 
 | # | Check | How to check | Status |
@@ -177,12 +177,36 @@ keeping the current match). Everything you see or type is pending.
 | 79 | Palette and keymap | The palette lists "Find", "Find next", "Find previous" and "Close find bar". In `keymap.toml`, bind `cmd-shift-f` to `find.open`: it opens the bar | Pending |
 | 80 | Light theme | `theme = "light"`: the matches are light yellow and orange, and the text on them is readable | Pending |
 | 81 | Big scrollback | Run `seq 1 200000`, then search `1`. Typing stays responsive. The counter shows `1/10000+` | Pending |
+| 82 | Regex anchors | Run `seq 1 5000`, Cmd+F, `.*` on, type `^4.*2$`. It matches `42`, `402`, `412` … `4992` (111 matches), each whole line, and nothing else | Pending |
+
+## Font zoom
+
+Cmd+= and Cmd+- change the font size of the terminal text by one point, and Cmd+0
+resets it. The zoom applies to every tab and pane, and each grid resizes to fit the same
+window. The offset lives in memory only. See `crates/app/README.md`.
+
+| # | Check | How to check | Status |
+| --- | --- | --- | --- |
+| 83 | Zoom math | `cargo test -p app zoom` (offset, clamp at 6 and 72, steps at the limits, hot-reload base) and `cargo test -p config minus` pass | Checked |
+| 84 | Zoom in | Press Cmd+=. The text in the focused pane gets bigger, and the grid gets fewer columns and rows. The window keeps its size | Pending |
+| 85 | Cmd+Shift+= zooms in too | Cmd+Shift+= (Cmd++ on a US layout) does the same as Cmd+= | Pending |
+| 86 | Zoom out and reset | Cmd+- makes the text one point smaller. Cmd+0 returns to the size in `config.toml` | Pending |
+| 87 | Every tab and pane | Two tabs, with a split in one. After Cmd+=, the text in every pane of both tabs is bigger | Pending |
+| 88 | Hidden tabs reflow too | Zoom in while tab 2 is active, then switch to tab 1. `stty size` in tab 1 shows the new rows and columns, not the old ones | Pending |
+| 89 | vim reflows after a zoom | Open `vim` on a long file, then Cmd+= twice. vim redraws to the new size, and `:echo &columns &lines` shows the new values | Pending |
+| 90 | htop reflows after a zoom | If `htop` is installed, run it and press Cmd+=. The columns and rows change, and the meters redraw without leftover text | Pending |
+| 91 | New tab and split use the zoomed size | Zoom in, then Cmd+T and Cmd+D. In each new pane, `stty size` gives the rows and columns that fit the pane, not `24 80` | Pending |
+| 92 | Clamp at 72 pt | Press Cmd+= until the text stops growing. One Cmd+- then shrinks it at once | Pending |
+| 93 | Clamp at 6 pt | Press Cmd+- until the text stops shrinking. One Cmd+= then grows it at once | Pending |
+| 94 | Zoom is not saved | Zoom in, quit, and start Bloco again. The text is the size in `config.toml`, and the file is unchanged | Pending |
+| 95 | Hot reload keeps the zoom | With `[font] size = 14`, zoom in twice, then set `size = 16` in `config.toml`. The text is 18 pt. Cmd+0 gives 16 pt | Pending |
+| 96 | Palette and keymap | The palette lists "Zoom in", "Zoom out" and "Reset zoom" with ⌘=, ⌘- and ⌘0. In `keymap.toml`, `keys = "cmd-shift-up"` with `action = "view.zoom_in"` zooms in, and `keys = "cmd--"` is accepted | Pending |
 
 ## Known issues
 
 - **Keyboard and screen checks are not run.** macOS denied keystroke injection to this
-  session (error 1002). Rows 8, 11, 16 to 17, 18 to 39, 41 to 45, 46 to 53, 54 to 63
-  and 65 to 81 need a manual run.
+  session (error 1002). Rows 8, 11, 16 to 17, 18 to 39, 41 to 45, 46 to 53, 54 to 63,
+  65 to 82 and 84 to 96 need a manual run.
 - **Command-line keys assume an emacs keymap.** In a shell's vi mode, the same bytes
   do something else.
 - **Left and right Option** are told apart with the keyboard device flags

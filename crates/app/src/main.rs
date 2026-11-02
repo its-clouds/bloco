@@ -5,6 +5,7 @@ mod colors;
 mod commands;
 mod find;
 mod keys;
+mod layout;
 mod mouse;
 mod option_key;
 mod palette;
@@ -12,6 +13,7 @@ mod split_tree;
 mod terminal_element;
 mod terminal_view;
 mod workspace;
+mod zoom;
 
 use gpui::{App, AppContext, Bounds, Menu, MenuItem, WindowBounds, WindowOptions, px, size};
 use gpui_platform::application;

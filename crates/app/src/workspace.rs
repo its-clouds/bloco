@@ -22,11 +22,13 @@ use term_session::{Session, SessionEvent};
 use crate::colors::Palette;
 use crate::commands::{
     self, ClosePane, CloseTab, FocusDown, FocusLeft, FocusRight, FocusUp, NewTab, NextTab,
-    PreviousTab, SelectTab, SplitDown, SplitRight, TogglePalette,
+    PreviousTab, SelectTab, SplitDown, SplitRight, TogglePalette, ZoomIn, ZoomOut, ZoomReset,
 };
+use crate::layout::{self, SavedLayout, SavedNode, SavedTab};
 use crate::palette::{PaletteState, pretty_keys};
-use crate::split_tree::{Axis, DIVIDER, Direction, Node, Rect, SplitTree};
+use crate::split_tree::{Axis, DIVIDER, Direction, MAX_RATIO, MIN_RATIO, Node, Rect, SplitTree};
 use crate::terminal_view::{TerminalEvent, TerminalStyle, TerminalView};
+use crate::zoom;
 
 /// Used when the configured font is not installed.
 const FALLBACK_FONT: &str = "Menlo";
@@ -51,7 +53,9 @@ struct DividerDrag {
 /// What a settings change installs. Built in full before anything changes, so
 /// a bad file leaves the running settings alone.
 struct Applied {
+    /// Its `font_size` is the configured size. The zoom is added when it is applied.
     style: TerminalStyle,
+    base_font_size: f32,
     bindings: Vec<KeyBinding>,
 }
 
@@ -59,6 +63,11 @@ pub struct Workspace {
     tabs: Vec<Tab>,
     active_tab: usize,
     style: TerminalStyle,
+    /// The font size in `config.toml`. `style.font_size` is this plus `zoom_offset`.
+    base_font_size: f32,
+    /// Zoom in points from the configured size. In memory only: it is not saved,
+    /// and a restart starts at the configured size. See `zoom.rs`.
+    zoom_offset: f32,
     /// Each pane's subscriptions, dropped when the pane closes.
     pane_subscriptions: HashMap<EntityId, Subscription>,
     /// The settings files as last read and applied. `None` after a read error.
@@ -70,10 +79,18 @@ pub struct Workspace {
     divider_drag: Option<DividerDrag>,
     /// The area that holds the panes, measured while painting.
     content_area: Rc<Cell<Bounds<Pixels>>>,
+    /// The layout as last written to disk. Only a change is written again.
+    last_saved: Option<SavedLayout>,
+    /// Writes the layout when the app quits. Dropping it unsubscribes.
+    _quit: Subscription,
 }
 
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let quit = cx.on_app_quit(|workspace, cx| {
+            workspace.save_layout(cx);
+            std::future::ready(())
+        });
         let (applied, seen_files, error) = match config::default_dir().map(|dir| Files::read(&dir)) {
             Some(Ok(files)) => match compile(&files, cx) {
                 Ok(applied) => (applied, Some(files), None),
@@ -90,6 +107,8 @@ impl Workspace {
             tabs: Vec::new(),
             active_tab: 0,
             style: applied.style,
+            base_font_size: applied.base_font_size,
+            zoom_offset: 0.0,
             pane_subscriptions: HashMap::new(),
             seen_files,
             error,
@@ -97,23 +116,31 @@ impl Workspace {
             palette_focus: cx.focus_handle(),
             divider_drag: None,
             content_area: Rc::new(Cell::new(Bounds::default())),
+            last_saved: None,
+            _quit: quit,
         };
-        match workspace.add_pane(None, window, cx) {
-            Ok(pane) => {
-                workspace.tabs.push(Tab {
-                    panes: SplitTree::new(pane.clone()),
-                    active: pane,
-                });
-                workspace.focus_active(window, cx);
+        workspace.style.font_size = workspace.font_size();
+        if !workspace.restore_layout(window, cx) {
+            match workspace.add_pane(None, window, cx) {
+                Ok(pane) => {
+                    workspace.tabs.push(Tab {
+                        panes: SplitTree::new(pane.clone()),
+                        active: pane,
+                    });
+                    workspace.focus_active(window, cx);
+                }
+                Err(e) => workspace.error = Some(e),
             }
-            Err(e) => workspace.error = Some(e),
         }
 
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(SETTINGS_POLL).await;
                 if this
-                    .update(cx, |workspace, cx| workspace.poll_settings(cx))
+                    .update(cx, |workspace, cx| {
+                        workspace.poll_settings(cx);
+                        workspace.save_layout(cx);
+                    })
                     .is_err()
                 {
                     break;
@@ -394,6 +421,102 @@ impl Workspace {
         }
     }
 
+    /// Writes the layout if it changed since the last write. Called on a timer
+    /// and on quit. With no tabs open (the last one just closed) nothing is
+    /// written, so the next launch starts fresh rather than with no tabs.
+    fn save_layout(&mut self, cx: &App) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        let layout = self.saved_layout(cx);
+        if self.last_saved.as_ref() == Some(&layout) {
+            return;
+        }
+        let Some(dir) = config::default_dir() else {
+            return;
+        };
+        match layout::save(&dir, &layout) {
+            Ok(()) => self.last_saved = Some(layout),
+            Err(e) => eprintln!("bloco: cannot save the layout: {e}"),
+        }
+    }
+
+    fn saved_layout(&self, cx: &App) -> SavedLayout {
+        SavedLayout {
+            tabs: self
+                .tabs
+                .iter()
+                .map(|tab| SavedTab {
+                    root: save_node(tab.panes.root(), cx),
+                    active: tab
+                        .panes
+                        .leaves()
+                        .iter()
+                        .position(|pane| *pane == tab.active)
+                        .unwrap_or(0),
+                })
+                .collect(),
+            active_tab: self.active_tab,
+        }
+    }
+
+    /// Opens the tabs from the saved layout, with a shell in each pane. Returns
+    /// `false` when there is no usable layout, and the caller opens one tab.
+    fn restore_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(saved) = config::default_dir().and_then(|dir| layout::load(&dir)) else {
+            return false;
+        };
+        if saved.tabs.is_empty() {
+            return false;
+        }
+        let mut tabs = Vec::new();
+        for saved_tab in &saved.tabs {
+            match self.restore_node(&saved_tab.root, window, cx) {
+                Ok(root) => {
+                    let panes = SplitTree::from_root(root);
+                    let leaves = panes.leaves();
+                    let active = leaves[saved_tab.active.min(leaves.len() - 1)].clone();
+                    tabs.push(Tab { panes, active });
+                }
+                Err(e) => {
+                    // Nothing is kept from a partial restore. Dropping the tabs drops their shells.
+                    eprintln!("bloco: cannot restore the layout: {e}");
+                    self.pane_subscriptions.clear();
+                    return false;
+                }
+            }
+        }
+        self.tabs = tabs;
+        self.active_tab = saved.active_tab.min(self.tabs.len() - 1);
+        self.focus_active(window, cx);
+        true
+    }
+
+    fn restore_node(
+        &mut self,
+        node: &SavedNode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Node<Entity<TerminalView>>, String> {
+        match node {
+            SavedNode::Pane { cwd } => {
+                let pane = self.add_pane(cwd.as_deref(), window, cx)?;
+                Ok(Node::Leaf(pane))
+            }
+            SavedNode::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => Ok(Node::Split {
+                axis: *axis,
+                ratio: ratio.clamp(MIN_RATIO, MAX_RATIO),
+                first: Box::new(self.restore_node(first, window, cx)?),
+                second: Box::new(self.restore_node(second, window, cx)?),
+            }),
+        }
+    }
+
     fn set_error(&mut self, error: Option<String>, cx: &mut Context<Self>) {
         if self.error != error {
             if let Some(error) = &error {
@@ -407,14 +530,43 @@ impl Workspace {
     fn apply(&mut self, applied: Applied, cx: &mut Context<Self>) {
         cx.clear_key_bindings();
         cx.bind_keys(applied.bindings);
+        self.style = applied.style;
+        // The zoom offset is kept, and applied to the new configured size.
+        self.base_font_size = applied.base_font_size;
+        self.set_font_size(cx);
+        cx.notify();
+    }
+
+    /// The terminal font size: the configured size plus the zoom, clamped.
+    fn font_size(&self) -> Pixels {
+        px(zoom::effective_size(self.base_font_size, self.zoom_offset))
+    }
+
+    /// Gives the current font size to every pane. Each pane re-measures its
+    /// cells and resizes its grid and PTY, in tabs that are hidden too.
+    fn set_font_size(&mut self, cx: &mut Context<Self>) {
+        self.style.font_size = self.font_size();
         for tab in &self.tabs {
             for pane in tab.panes.leaves() {
-                let style = applied.style.clone();
+                let style = self.style.clone();
                 pane.update(cx, |view, cx| view.apply_style(style, cx));
             }
         }
-        self.style = applied.style;
-        cx.notify();
+    }
+
+    fn zoom_in(&mut self, _: &ZoomIn, _: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_offset = zoom::stepped_offset(self.base_font_size, self.zoom_offset, 1.0);
+        self.set_font_size(cx);
+    }
+
+    fn zoom_out(&mut self, _: &ZoomOut, _: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_offset = zoom::stepped_offset(self.base_font_size, self.zoom_offset, -1.0);
+        self.set_font_size(cx);
+    }
+
+    fn zoom_reset(&mut self, _: &ZoomReset, _: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_offset = 0.0;
+        self.set_font_size(cx);
     }
 
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -761,7 +913,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::focus_up))
             .on_action(cx.listener(Self::focus_down))
             .on_action(cx.listener(Self::toggle_palette))
-            .child(self.render_tab_bar(cx))
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::zoom_reset))
+            .when(self.tabs.len() > 1, |root| root.child(self.render_tab_bar(cx)))
             .child(self.render_content(cx));
         if let Some(error) = &self.error {
             root = root.child(
@@ -793,6 +948,7 @@ fn compile(files: &Files, cx: &App) -> Result<Applied, String> {
             font_size: px(settings.config.font.size),
             option_as_meta: settings.config.option_as_meta,
         },
+        base_font_size: settings.config.font.size,
         bindings,
     })
 }
@@ -817,6 +973,26 @@ fn shortcut_text(window: &Window, action: &dyn Action) -> String {
         String::new()
     } else {
         pretty_keys(&window.keystroke_text_for(action))
+    }
+}
+
+/// The saved form of a split tree. The directory is read from each pane's shell.
+fn save_node(node: &Node<Entity<TerminalView>>, cx: &App) -> SavedNode {
+    match node {
+        Node::Leaf(pane) => SavedNode::Pane {
+            cwd: pane.read(cx).cwd(),
+        },
+        Node::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => SavedNode::Split {
+            axis: *axis,
+            ratio: *ratio,
+            first: Box::new(save_node(first, cx)),
+            second: Box::new(save_node(second, cx)),
+        },
     }
 }
 

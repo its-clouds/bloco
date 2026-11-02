@@ -1,17 +1,19 @@
 //! Find in the terminal output: every match of a query in the scrollback and on
 //! the screen.
 //!
-//! The search runs on `alacritty_terminal`'s regex engine (`RegexSearch` and
-//! `RegexIter`), the way `zed-industries/zed` does it in
-//! crates/terminal/src/alacritty.rs (`all_search_matches`, GPL-3.0-or-later).
-//! See NOTICE.
+//! The grid is read one logical line at a time: rows joined while the output
+//! wrapped, with the blank cells after the last character dropped. Each line is
+//! searched with the `regex` crate, so `^` and `$` mean the start and end of the
+//! line as the program printed it. A map from each character back to its cell
+//! turns byte offsets into grid positions.
 
 use std::collections::VecDeque;
 
 use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Column, Direction, Point};
-use alacritty_terminal::term::search::{RegexIter, RegexSearch};
+use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::Term;
+use regex::{Regex, RegexBuilder};
 
 /// Matches stop being collected after this many, so a one-letter query on a
 /// full scrollback stays cheap to store and to draw.
@@ -51,67 +53,126 @@ pub struct FindResults {
     pub truncated: bool,
 }
 
+/// Where one character of a logical line sits in the grid.
+#[derive(Debug, Clone, Copy)]
+struct CharCell {
+    /// Byte offset of the character in the line text.
+    byte: usize,
+    /// Its first cell.
+    start: BufferPoint,
+    /// Its last cell: the spacer column for a wide character.
+    end: BufferPoint,
+}
+
 /// Every match of `query` in `term`, oldest first. An empty query has no
-/// matches. Fails when `query` is an invalid regular expression.
+/// matches, and neither has a regex that only matches empty text. Fails when
+/// `query` is an invalid regular expression.
 pub fn find_all<T>(term: &Term<T>, query: &FindQuery) -> Result<FindResults, String> {
     if query.text.is_empty() {
         return Ok(FindResults::default());
     }
-    let mut regex = compile(query)?;
+    let regex = compile(query)?;
     let grid = term.grid();
     let history = grid.history_size() as i32;
-    let to_buffer = |point: Point| BufferPoint {
-        line: (point.line.0 + history) as usize,
-        column: point.column.0,
-    };
-    let top = Point::new(grid.topmost_line(), Column(0));
-    let bottom = Point::new(grid.bottommost_line(), grid.last_column());
+    let columns = grid.columns();
+    let last_line = grid.bottommost_line().0;
 
-    // Top down, because a leftward search finds different (overlapping) matches
-    // for greedy patterns. The newest output matters most, so past the limit the
-    // oldest matches are dropped.
+    // The newest output matters most, so past the limit the oldest matches go.
     let mut matches = VecDeque::new();
     let mut truncated = false;
-    for found in RegexIter::new(top, bottom, Direction::Right, term, &mut regex) {
-        if matches.len() == MAX_MATCHES {
-            matches.pop_front();
-            truncated = true;
+    // Reused for every logical line.
+    let mut text = String::new();
+    let mut cells: Vec<CharCell> = Vec::new();
+
+    let mut line = grid.topmost_line().0;
+    while line <= last_line {
+        text.clear();
+        cells.clear();
+        // Rows of one logical line: each row that ends in WRAPLINE continues below.
+        loop {
+            let row = &grid[Line(line)];
+            let buffer_line = (line + history) as usize;
+            for column in 0..columns {
+                let cell = &row[Column(column)];
+                if cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                let start = BufferPoint {
+                    line: buffer_line,
+                    column,
+                };
+                let end = if cell.flags.contains(Flags::WIDE_CHAR) {
+                    BufferPoint {
+                        line: buffer_line,
+                        column: (column + 1).min(columns - 1),
+                    }
+                } else {
+                    start
+                };
+                let mut push = |c: char| {
+                    cells.push(CharCell {
+                        byte: text.len(),
+                        start,
+                        end,
+                    });
+                    text.push(c);
+                };
+                push(cell.c);
+                for &c in cell.zerowidth().unwrap_or_default() {
+                    push(c);
+                }
+            }
+            let wrapped = row[Column(columns - 1)].flags.contains(Flags::WRAPLINE);
+            line += 1;
+            if !wrapped || line > last_line {
+                break;
+            }
         }
-        matches.push_back(FindMatch {
-            start: to_buffer(*found.start()),
-            end: to_buffer(*found.end()),
-        });
+
+        // The blank cells after the last character are not output.
+        let trimmed = text.trim_end_matches(' ').len();
+        text.truncate(trimmed);
+        let kept = cells.partition_point(|cell| cell.byte < trimmed);
+        cells.truncate(kept);
+
+        for found in regex.find_iter(&text) {
+            if found.is_empty() {
+                continue;
+            }
+            // The character that holds the last byte of the match.
+            let first = cells.partition_point(|cell| cell.byte <= found.start()) - 1;
+            let last = cells.partition_point(|cell| cell.byte < found.end()) - 1;
+            if matches.len() == MAX_MATCHES {
+                matches.pop_front();
+                truncated = true;
+            }
+            matches.push_back(FindMatch {
+                start: cells[first].start,
+                end: cells[last].end,
+            });
+        }
     }
+
     Ok(FindResults {
         matches: matches.into(),
         truncated,
     })
 }
 
-/// Builds the search automaton. `alacritty_terminal` picks the case rule from
-/// the query (case-insensitive unless it has an upper-case letter), so a
-/// leading flag sets the rule the user chose instead. A flag at the start of a
-/// pattern covers every alternative after it.
-fn compile(query: &FindQuery) -> Result<RegexSearch, String> {
+/// Builds the regex. Literal text is escaped first.
+fn compile(query: &FindQuery) -> Result<Regex, String> {
     let pattern = if query.regex {
         query.text.clone()
     } else {
-        escape(&query.text)
+        regex::escape(&query.text)
     };
-    let flag = if query.case_sensitive { "(?-i)" } else { "(?i)" };
-    RegexSearch::new(&format!("{flag}{pattern}")).map_err(|e| e.to_string())
-}
-
-/// Escapes the regex syntax characters in `text`, so it matches literally.
-fn escape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        if r"\.+*?()|[]{}^$#&-~".contains(c) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
+    RegexBuilder::new(&pattern)
+        .case_insensitive(!query.case_sensitive)
+        .build()
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -183,7 +244,7 @@ mod tests {
     fn case_insensitive_by_default_even_with_capitals() {
         let term = term(40, 5, "Foo foo FOO\r\n");
         assert_eq!(find_all(&term, &query("foo")).unwrap().matches.len(), 3);
-        // alacritty's own rule would make this query case-sensitive.
+        // An upper-case query is still case-insensitive with the toggle off.
         assert_eq!(find_all(&term, &query("FOO")).unwrap().matches.len(), 3);
     }
 
@@ -209,7 +270,7 @@ mod tests {
             spans(&find_all(&term, &regex(r"\d+")).unwrap()),
             [(0, 3, 5), (0, 10, 11), (1, 8, 9)]
         );
-        // The case flag covers every alternative.
+        // Case-insensitive across every alternative.
         assert_eq!(
             spans(&find_all(&term, &regex("ABC|ERROR")).unwrap()),
             [(0, 0, 2), (1, 0, 4)]
@@ -276,8 +337,101 @@ mod tests {
     }
 
     #[test]
-    fn escape_covers_the_regex_syntax() {
-        assert_eq!(escape("a.b*c"), r"a\.b\*c");
-        assert_eq!(escape("ação"), "ação");
+    fn anchors_match_whole_lines() {
+        let output: String = (1..=5000).map(|i| format!("{i}\r\n")).collect();
+        let term = term(80, 24, &output);
+        let regex = FindQuery {
+            regex: true,
+            ..query("^4.*2$")
+        };
+        let results = find_all(&term, &regex).unwrap();
+        // `seq 1 5000` fits in the default 10,000-line scrollback.
+        assert!(term.grid().history_size() + 24 > 5000);
+        let expected: Vec<usize> = (1..=5000)
+            .filter(|i| {
+                let s = i.to_string();
+                s.starts_with('4') && s.ends_with('2')
+            })
+            .collect();
+        assert!(!expected.is_empty());
+        assert_eq!(results.matches.len(), expected.len());
+        for (found, number) in results.matches.iter().zip(&expected) {
+            let digits = number.to_string().len();
+            assert_eq!(found.start.column, 0);
+            assert_eq!(found.end.column, digits - 1);
+        }
+    }
+
+    #[test]
+    fn dollar_ignores_the_blank_cells_after_the_text() {
+        let term = term(40, 5, "42\r\n42 x\r\n");
+        let regex = FindQuery {
+            regex: true,
+            ..query("2$")
+        };
+        assert_eq!(spans(&find_all(&term, &regex).unwrap()), [(0, 1, 1)]);
+    }
+
+    #[test]
+    fn caret_matches_once_per_line() {
+        let term = term(40, 5, "4242\r\n");
+        let regex = FindQuery {
+            regex: true,
+            ..query("^42")
+        };
+        assert_eq!(spans(&find_all(&term, &regex).unwrap()), [(0, 0, 1)]);
+    }
+
+    #[test]
+    fn anchors_apply_to_the_logical_line() {
+        // Ten columns: the line wraps after `9`, so `abcdef` is the same line.
+        let term = term(10, 5, "0123456789abcdef\r\n");
+        let regex = |text: &str| FindQuery {
+            regex: true,
+            ..query(text)
+        };
+        assert_eq!(
+            find_all(&term, &regex("^0.*f$")).unwrap().matches,
+            [FindMatch {
+                start: at(0, 0),
+                end: at(1, 5),
+            }]
+        );
+        // The second row does not start a line.
+        assert!(find_all(&term, &regex("^abc")).unwrap().matches.is_empty());
+        assert!(find_all(&term, &regex("9$")).unwrap().matches.is_empty());
+    }
+
+    #[test]
+    fn wide_characters_map_to_their_cells() {
+        let term = term(40, 5, "日本語 ok 🙂x\r\n");
+        // 日 0-1, 本 2-3, 語 4-5, space 6, o 7, k 8, space 9, 🙂 10-11, x 12.
+        assert_eq!(spans(&find_all(&term, &query("本")).unwrap()), [(0, 2, 3)]);
+        assert_eq!(spans(&find_all(&term, &query("語 ok")).unwrap()), [(0, 4, 8)]);
+        assert_eq!(spans(&find_all(&term, &query("🙂x")).unwrap()), [(0, 10, 12)]);
+        assert_eq!(spans(&find_all(&term, &query("x")).unwrap()), [(0, 12, 12)]);
+    }
+
+    #[test]
+    fn a_wide_character_that_wrapped_keeps_its_cells() {
+        // Five columns: `日` does not fit after `abcd`, so it starts the next row.
+        let term = term(5, 5, "abcd日z\r\n");
+        assert_eq!(
+            find_all(&term, &query("d日")).unwrap().matches,
+            [FindMatch {
+                start: at(0, 3),
+                end: at(1, 1),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_regex_that_only_matches_empty_text_finds_nothing() {
+        let term = term(40, 5, "hello\r\n");
+        let regex = FindQuery {
+            regex: true,
+            ..query("x*")
+        };
+        assert!(find_all(&term, &regex).unwrap().matches.is_empty());
     }
 }

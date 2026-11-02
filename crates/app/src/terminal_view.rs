@@ -31,7 +31,7 @@ use crate::find::{FindState, Pick};
 use crate::keys::{TextEdit, text_edit_bytes, to_esc_str};
 use crate::mouse::{alt_scroll, mouse_button_report, mouse_moved_report, scroll_report};
 use crate::option_key::option_keys_down;
-use crate::terminal_element::{Metrics, TerminalElement};
+use crate::terminal_element::{Metrics, TerminalElement, cell_metrics, grid_size};
 
 /// What a pane tells its workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +59,10 @@ pub struct TerminalStyle {
 /// wait joins the same run, so a busy shell searches a few times a second at most.
 const FIND_REFRESH: Duration = Duration::from_millis(150);
 const FIND_BAR_WIDTH: f32 = 400.0;
+/// Half a blink cycle: the cursor is shown for this long, then hidden for as long.
+const CURSOR_BLINK: Duration = Duration::from_millis(530);
+/// How long the visual bell tints the pane.
+const BELL_FLASH: Duration = Duration::from_millis(150);
 
 /// A URL under the mouse while Cmd is held.
 struct HoveredLink {
@@ -92,6 +96,14 @@ pub struct TerminalView {
     find_task: Option<Task<()>>,
     /// New output is waiting to rerun the search.
     find_refresh_pending: bool,
+    /// Whether the cursor is in the shown half of its blink.
+    cursor_on: bool,
+    /// The blink timer. A keypress replaces it, so the cursor stays solid while typing.
+    blink_task: Option<Task<()>>,
+    /// The visual bell is tinting the pane.
+    bell_on: bool,
+    /// Ends the bell flash. A new bell replaces it.
+    bell_task: Option<Task<()>>,
 }
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
@@ -117,7 +129,7 @@ impl TerminalView {
         })
         .detach();
         let tab_label = tab_label(&session);
-        Self {
+        let mut view = Self {
             session,
             focus_handle: cx.focus_handle(),
             palette: style.palette,
@@ -135,16 +147,78 @@ impl TerminalView {
             last_find: FindQuery::default(),
             find_task: None,
             find_refresh_pending: false,
-        }
+            cursor_on: true,
+            blink_task: None,
+            bell_on: false,
+            bell_task: None,
+        };
+        view.restart_cursor_blink(cx);
+        view
     }
 
-    /// Applies new colors, font or Option-key behavior from a config reload.
+    /// Shows the cursor and starts a new blink cycle from now. Called on each
+    /// keypress and on start. Replacing `blink_task` cancels the old cycle.
+    fn restart_cursor_blink(&mut self, cx: &mut Context<Self>) {
+        self.cursor_on = true;
+        self.blink_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(CURSOR_BLINK).await;
+                let toggled = this.update(cx, |view, cx| {
+                    view.cursor_on = !view.cursor_on;
+                    cx.notify();
+                });
+                if toggled.is_err() {
+                    break;
+                }
+            }
+        }));
+        cx.notify();
+    }
+
+    /// Tints the pane for a moment. A bell during a flash restarts it.
+    fn ring_bell(&mut self, cx: &mut Context<Self>) {
+        self.bell_on = true;
+        self.bell_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(BELL_FLASH).await;
+            let _ = this.update(cx, |view, cx| {
+                view.bell_on = false;
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// Applies new colors, font or Option-key behavior from a config reload or a zoom.
     pub fn apply_style(&mut self, style: TerminalStyle, cx: &mut Context<Self>) {
         self.palette = style.palette;
         self.font_family = style.font_family;
         self.font_size = style.font_size;
         self.option_as_meta = style.option_as_meta;
+        self.fit_grid(cx);
         cx.notify();
+    }
+
+    /// Re-measures the cells at the current font and resizes the grid and the PTY
+    /// to the pane's last size. The element does this on each frame it paints. A
+    /// pane in a hidden tab does not paint, so the change is made here as well.
+    /// A pane that has never been painted has no size yet, and is left alone.
+    fn fit_grid(&self, cx: &App) {
+        let metrics = self.metrics.get();
+        if f32::from(metrics.size.width) <= 0.0 {
+            return;
+        }
+        let (cell_width, line_height) = cell_metrics(cx, &self.font_family, self.font_size);
+        let (columns, rows) = grid_size(metrics.size, cell_width, line_height);
+        if (columns, rows) != (metrics.columns, metrics.rows) {
+            let _ = self.session.resize(columns as u16, rows as u16);
+        }
+        self.metrics.set(Metrics {
+            cell_width,
+            line_height,
+            columns,
+            rows,
+            ..metrics
+        });
     }
 
     /// The directory the shell is in. `None` if neither OSC 7 nor the OS can say.
@@ -170,6 +244,10 @@ impl TerminalView {
             }
             SessionEvent::Title(title) => cx.emit(TerminalEvent::Title(title)),
             SessionEvent::Exit => cx.emit(TerminalEvent::Exited),
+            SessionEvent::Clipboard(text) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            SessionEvent::Bell => self.ring_bell(cx),
         }
     }
 
@@ -191,6 +269,7 @@ impl TerminalView {
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.restart_cursor_blink(cx);
         let mode = self.session.mode();
         let keystroke = &event.keystroke;
         let modifiers = keystroke.modifiers;
@@ -250,6 +329,7 @@ impl TerminalView {
 
     /// Text committed by the keyboard or the input method.
     fn commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.restart_cursor_blink(cx);
         self.marked_text = None;
         if !text.is_empty() {
             self.send_input(text.as_bytes());
@@ -289,11 +369,13 @@ impl TerminalView {
         } else {
             text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
         };
+        self.restart_cursor_blink(cx);
         self.send_input(&bytes);
     }
 
     /// Sends a command-line edit to the shell, or the matching key to a full-screen app.
     fn text_edit(&mut self, edit: TextEdit, cx: &mut Context<Self>) {
+        self.restart_cursor_blink(cx);
         if let Some(bytes) = text_edit_bytes(edit, self.session.mode()) {
             self.send_input(bytes.as_bytes());
         }
@@ -823,6 +905,8 @@ impl Render for TerminalView {
                 marked_text: self.marked_text.clone(),
                 hovered_link,
                 find,
+                cursor_on: self.cursor_on,
+                bell: self.bell_on,
             })
             .children(find_bar)
     }
