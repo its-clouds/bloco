@@ -8,9 +8,12 @@ pub struct Rgb(pub u32);
 /// Colors for the UI around the terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Chrome {
+    /// Title bar and tab strip background.
     pub tab_bar: Rgb,
+    /// Background of the active tab pill.
     pub tab_active: Rgb,
-    pub tab_inactive: Rgb,
+    /// Background of an inactive tab pill under the pointer.
+    pub tab_hover: Rgb,
     /// Background of a tab's close button under the pointer.
     pub close_hover: Rgb,
     /// Text on the tab bar and in the palette.
@@ -18,11 +21,15 @@ pub struct Chrome {
     /// Secondary text, such as keybindings in the palette.
     pub muted: Rgb,
     pub divider: Rgb,
+    /// Background of the palette and find bar.
     pub overlay: Rgb,
+    /// Raised surfaces inside the terminal, such as the input area and chips.
+    pub surface: Rgb,
     /// Background of the selected palette row.
     pub selected: Rgb,
     pub accent: Rgb,
     pub error: Rgb,
+    pub success: Rgb,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,16 +90,18 @@ impl Scheme {
             ansi,
             chrome: Chrome {
                 tab_bar: mix(bg, Rgb(0), 0.25),
-                tab_active: bg,
-                tab_inactive: mix(bg, fg, 0.08),
+                tab_active: mix(bg, fg, 0.1),
+                tab_hover: mix(bg, fg, 0.05),
                 close_hover: mix(bg, fg, 0.2),
                 text: fg,
                 muted: mix(fg, bg, 0.45),
                 divider: mix(bg, fg, 0.2),
                 overlay: mix(bg, fg, 0.06),
+                surface: mix(bg, fg, 0.04),
                 selected: mix(bg, fg, 0.2),
                 accent: ansi[4],
                 error: ansi[1],
+                success: ansi[2],
             },
         }
     }
@@ -109,64 +118,66 @@ pub(crate) fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
 }
 
 impl Theme {
-    /// Tomorrow Night, close to what most dark terminals ship with.
+    /// Bloco Night: a cool near-black with a soft periwinkle accent.
     pub fn dark() -> Self {
         Self {
             name: "dark".into(),
-            background: Rgb(0x1d1f21),
-            foreground: Rgb(0xc5c8c6),
-            cursor: Rgb(0xc5c8c6),
-            selection: Rgb(0x373b41),
-            find_match: Rgb(0xf0c674),
-            find_current: Rgb(0xde935f),
-            find_text: Rgb(0x1d1f21),
+            background: Rgb(0x15171c),
+            foreground: Rgb(0xd5d9e3),
+            cursor: Rgb(0x8da2ff),
+            selection: Rgb(0x2c3350),
+            find_match: Rgb(0xe2b86b),
+            find_current: Rgb(0xf08c5a),
+            find_text: Rgb(0x15171c),
             ansi: [
-                Rgb(0x1d1f21),
-                Rgb(0xcc6666),
-                Rgb(0xb5bd68),
-                Rgb(0xf0c674),
-                Rgb(0x81a2be),
-                Rgb(0xb294bb),
-                Rgb(0x8abeb7),
-                Rgb(0xc5c8c6),
-                Rgb(0x666666),
-                Rgb(0xd54e53),
-                Rgb(0xb9ca4a),
-                Rgb(0xe7c547),
-                Rgb(0x7aa6da),
-                Rgb(0xc397d8),
-                Rgb(0x70c0b1),
-                Rgb(0xeaeaea),
+                Rgb(0x23262e),
+                Rgb(0xf0717d),
+                Rgb(0x9fd17a),
+                Rgb(0xe5c07b),
+                Rgb(0x7aa2f7),
+                Rgb(0xc39bf2),
+                Rgb(0x6fd0e0),
+                Rgb(0xc8ccd6),
+                Rgb(0x5c6372),
+                Rgb(0xff8a95),
+                Rgb(0xb4e391),
+                Rgb(0xf2d398),
+                Rgb(0x9bb8ff),
+                Rgb(0xd5b4ff),
+                Rgb(0x8fe0ee),
+                Rgb(0xf2f4f8),
             ],
             chrome: Chrome {
-                tab_bar: Rgb(0x141517),
-                tab_active: Rgb(0x1d1f21),
-                tab_inactive: Rgb(0x25282c),
-                close_hover: Rgb(0x373b41),
-                text: Rgb(0xc5c8c6),
-                muted: Rgb(0x7c8086),
-                divider: Rgb(0x373b41),
-                overlay: Rgb(0x25282c),
-                selected: Rgb(0x373b41),
-                accent: Rgb(0x81a2be),
-                error: Rgb(0xcc6666),
+                tab_bar: Rgb(0x0f1014),
+                tab_active: Rgb(0x22252e),
+                tab_hover: Rgb(0x1a1c23),
+                close_hover: Rgb(0x2e323d),
+                text: Rgb(0xe3e6ee),
+                muted: Rgb(0x7d8494),
+                divider: Rgb(0x262932),
+                overlay: Rgb(0x1c1e25),
+                surface: Rgb(0x1b1d24),
+                selected: Rgb(0x2a2f42),
+                accent: Rgb(0x8da2ff),
+                error: Rgb(0xf0717d),
+                success: Rgb(0x9fd17a),
             },
         }
     }
 
-    /// One Light, with the same ANSI order as the dark theme.
+    /// Bloco Day: the light twin of Bloco Night.
     pub fn light() -> Self {
         Self {
             name: "light".into(),
-            background: Rgb(0xfafafa),
-            foreground: Rgb(0x383a42),
-            cursor: Rgb(0x526fff),
-            selection: Rgb(0xd7dae0),
+            background: Rgb(0xfbfbfc),
+            foreground: Rgb(0x2f3340),
+            cursor: Rgb(0x4f6bed),
+            selection: Rgb(0xd9e0fb),
             find_match: Rgb(0xffe08a),
-            find_current: Rgb(0xff9f43),
-            find_text: Rgb(0x383a42),
+            find_current: Rgb(0xffb070),
+            find_text: Rgb(0x2f3340),
             ansi: [
-                Rgb(0x383a42),
+                Rgb(0x2f3340),
                 Rgb(0xe45649),
                 Rgb(0x50a14f),
                 Rgb(0xc18401),
@@ -184,17 +195,19 @@ impl Theme {
                 Rgb(0xffffff),
             ],
             chrome: Chrome {
-                tab_bar: Rgb(0xe6e6e6),
-                tab_active: Rgb(0xfafafa),
-                tab_inactive: Rgb(0xd8d8d8),
-                close_hover: Rgb(0xc8c8c8),
-                text: Rgb(0x383a42),
-                muted: Rgb(0x8a8f99),
-                divider: Rgb(0xc8c8c8),
+                tab_bar: Rgb(0xeceef2),
+                tab_active: Rgb(0xffffff),
+                tab_hover: Rgb(0xe2e5eb),
+                close_hover: Rgb(0xd6dae2),
+                text: Rgb(0x2f3340),
+                muted: Rgb(0x7a8091),
+                divider: Rgb(0xe0e3e9),
                 overlay: Rgb(0xffffff),
-                selected: Rgb(0xe0e4ea),
-                accent: Rgb(0x4078f2),
-                error: Rgb(0xb3261e),
+                surface: Rgb(0xf2f3f6),
+                selected: Rgb(0xe3e8fc),
+                accent: Rgb(0x4f6bed),
+                error: Rgb(0xd03b4a),
+                success: Rgb(0x3f9a4c),
             },
         }
     }

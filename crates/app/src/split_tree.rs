@@ -40,8 +40,9 @@ pub enum Direction {
     Down,
 }
 
-/// Width of the divider between two panes, in pixels.
-pub const DIVIDER: f32 = 4.0;
+/// Width of the divider between two panes, in pixels. The visible line is 1px.
+/// The grab area around it is wider; see `workspace.rs`.
+pub const DIVIDER: f32 = 1.0;
 /// The share of a split that the first pane can take. Keeps both panes usable.
 pub const MIN_RATIO: f32 = 0.1;
 pub const MAX_RATIO: f32 = 0.9;
@@ -341,8 +342,8 @@ mod tests {
         assert_eq!(layout[0].0, 1);
         assert_eq!(layout[1].0, 2);
         assert_eq!(layout[0].1.width, 402.0);
-        assert_eq!(layout[1].1.x, 406.0);
-        assert_eq!(layout[1].1.width, 398.0);
+        assert_eq!(layout[1].1.x, 403.0);
+        assert_eq!(layout[1].1.width, 401.0);
     }
 
     #[test]
@@ -350,8 +351,8 @@ mod tests {
         let mut tree = SplitTree::new(1);
         tree.split(&1, Axis::Vertical, 2);
         let layout = tree.layout(AREA);
-        assert_eq!(layout[1].1.y, 204.0);
-        assert_eq!(layout[1].1.height, 196.0);
+        assert_eq!(layout[1].1.y, 201.0);
+        assert_eq!(layout[1].1.height, 199.0);
         assert_eq!(layout[1].1.width, AREA.width);
     }
 
@@ -423,8 +424,8 @@ mod tests {
         tree.split(&2, Axis::Vertical, 3);
         let (axis, rect) = tree.split_at(&[1], AREA).unwrap();
         assert_eq!(axis, Axis::Vertical);
-        assert_eq!(rect.x, 406.0);
-        assert_eq!(rect.width, 398.0);
+        assert_eq!(rect.x, 403.0);
+        assert_eq!(rect.width, 401.0);
         assert_eq!(tree.split_at(&[1, 0], AREA), None);
     }
 }

@@ -8,6 +8,12 @@ use std::path::{Path, PathBuf};
 /// Rows the tree shows at most. A bigger tree is cut off so the sidebar stays quick.
 const MAX_ROWS: usize = 2000;
 
+/// The width the sidebar starts at, in pixels.
+pub const SIDEBAR_WIDTH: f32 = 260.0;
+/// The narrowest and the widest the sidebar can be dragged, in pixels.
+pub const SIDEBAR_MIN: f32 = 180.0;
+pub const SIDEBAR_MAX: f32 = 480.0;
+
 /// Which list the sidebar shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
@@ -17,11 +23,29 @@ pub enum Mode {
 }
 
 /// The sidebar as the workspace keeps it. Closed at startup.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Sidebar {
     pub open: bool,
     pub mode: Mode,
     pub tree: FileTree,
+    /// The width in pixels. Both panels share it.
+    pub width: f32,
+}
+
+impl Default for Sidebar {
+    fn default() -> Self {
+        Self {
+            open: false,
+            mode: Mode::default(),
+            tree: FileTree::default(),
+            width: SIDEBAR_WIDTH,
+        }
+    }
+}
+
+/// Keeps a sidebar width inside `SIDEBAR_MIN..=SIDEBAR_MAX`.
+pub fn clamp_width(width: f32) -> f32 {
+    width.clamp(SIDEBAR_MIN, SIDEBAR_MAX)
 }
 
 /// One line of the file tree.
@@ -240,6 +264,14 @@ mod tests {
         assert!(tree.rows().is_empty());
         tree.set_root(None);
         assert!(tree.root().is_none());
+    }
+
+    #[test]
+    fn the_width_stays_between_the_limits() {
+        assert_eq!(clamp_width(100.0), SIDEBAR_MIN);
+        assert_eq!(clamp_width(300.0), 300.0);
+        assert_eq!(clamp_width(900.0), SIDEBAR_MAX);
+        assert_eq!(Sidebar::default().width, SIDEBAR_WIDTH);
     }
 
     #[test]

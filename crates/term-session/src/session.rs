@@ -205,7 +205,7 @@ pub struct Snapshot {
 
 /// What a pane draws in one frame: visual rows from the top, each with its
 /// cells. A plain frame has one row per viewport line. With blocks, a header
-/// row replaces a finished command's prompt and command lines.
+/// row replaces a command's prompt and command lines.
 pub struct Frame {
     /// One entry per visual row, top first.
     pub rows: Vec<Row>,
@@ -448,88 +448,25 @@ impl Session {
         take_snapshot(&mut guard.term)
     }
 
+    /// Whether the input is docked: a prompt mark (`B`) has come and the
+    /// alternate screen is off. A docked pane draws the input at its bottom
+    /// and hides the shell's live prompt (see [`Session::frame`]).
+    pub fn docked(&self) -> bool {
+        let state = self.state.lock().expect("state lock poisoned");
+        state.blocks.prompt_seen() && !state.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
     /// What to draw this frame. With command blocks on screen, the rows follow
     /// the blocks (see [`Row`]). On the alternate screen, or with no blocks, the
     /// frame is the plain grid, one row per viewport line. Resets damage, like
     /// [`Session::snapshot`].
-    pub fn frame(&self, selected: Option<u64>) -> Frame {
+    ///
+    /// With `hide_prompt`, the shell's live prompt is not drawn: the rows stop
+    /// before its `A` mark, so the frame can have fewer rows than the screen.
+    /// The cursor is not drawn then either.
+    pub fn frame(&self, selected: Option<u64>, hide_prompt: bool) -> Frame {
         let mut guard = self.state.lock().expect("state lock poisoned");
-        let State { term, blocks, .. } = &mut *guard;
-        let all = blocks.all();
-        if term.mode().contains(TermMode::ALT_SCREEN) || all.is_empty() {
-            let snapshot = take_snapshot(term);
-            return Frame {
-                rows: (0..snapshot.rows)
-                    .map(|line| Row::Line(snapshot.top_line + line))
-                    .collect(),
-                columns: snapshot.columns,
-                cells: snapshot.cells,
-                cursor: snapshot.cursor,
-                headers: Vec::new(),
-                sticky: None,
-                selected: None,
-            };
-        }
-
-        let history = term.grid().history_size();
-        let screen = term.screen_lines();
-        let top = history - term.grid().display_offset();
-        let rows = blocks::frame_rows(all, top, history + screen, screen);
-        let columns = term.columns();
-        let content = term.renderable_content();
-        let selection = content.selection;
-
-        let mut cells = Vec::with_capacity(rows.len() * columns);
-        let mut headers = Vec::new();
-        for (line, row) in rows.iter().enumerate() {
-            match *row {
-                Row::Line(buffer_line) => {
-                    let grid_line = Line(buffer_line as i32 - history as i32);
-                    for column in 0..columns {
-                        let cell = &term.grid()[grid_line][Column(column)];
-                        cells.push(SnapshotCell {
-                            line,
-                            column,
-                            c: cell.c,
-                            zerowidth: cell.zerowidth().map(Box::from),
-                            fg: cell.fg,
-                            bg: cell.bg,
-                            flags: cell.flags,
-                            selected: selection
-                                .is_some_and(|s| s.contains(Point::new(grid_line, Column(column)))),
-                        });
-                    }
-                }
-                Row::Header(id) => {
-                    headers.extend(all.iter().find(|block| block.id == id).cloned());
-                    cells.extend((0..columns).map(|column| blank_cell(line, column)));
-                }
-            }
-        }
-
-        let cursor_line = history + content.cursor.point.line.0 as usize;
-        let cursor_row = rows.iter().position(|row| *row == Row::Line(cursor_line));
-        let cursor = Cursor {
-            line: cursor_row.unwrap_or(0),
-            column: content.cursor.point.column.0,
-            visible: cursor_row.is_some() && content.cursor.shape != CursorShape::Hidden,
-            shape: content.cursor.shape,
-        };
-        let sticky = match rows.first() {
-            Some(Row::Line(line)) => blocks::block_containing_output(all, *line).cloned(),
-            _ => None,
-        };
-
-        let selected = selected.and_then(|id| selected_rows(all, &rows, id));
-        Frame {
-            rows,
-            columns,
-            cells,
-            cursor,
-            headers,
-            sticky,
-            selected,
-        }
+        frame_of(&mut guard, selected, hide_prompt)
     }
 
     /// The terminal mode flags: alternate screen, mouse reporting, bracketed
@@ -798,6 +735,107 @@ fn take_snapshot(term: &mut Term<PtyResponder>) -> Snapshot {
     }
 }
 
+/// What to draw of `state`. See [`Session::frame`].
+fn frame_of(state: &mut State, selected: Option<u64>, hide_prompt: bool) -> Frame {
+    let State { term, blocks, .. } = state;
+    let all = blocks.all();
+    let alternate = term.mode().contains(TermMode::ALT_SCREEN);
+    // The shell's live prompt, from its `A` mark down, is hidden when asked.
+    let hidden_from = if hide_prompt && !alternate {
+        blocks.live_prompt_line()
+    } else {
+        None
+    };
+    if alternate || (all.is_empty() && hidden_from.is_none()) {
+        let snapshot = take_snapshot(term);
+        return Frame {
+            rows: (0..snapshot.rows)
+                .map(|line| Row::Line(snapshot.top_line + line))
+                .collect(),
+            columns: snapshot.columns,
+            cells: snapshot.cells,
+            cursor: snapshot.cursor,
+            headers: Vec::new(),
+            sticky: None,
+            selected: None,
+        };
+    }
+
+    let history = term.grid().history_size();
+    let screen = term.screen_lines();
+    let top = history - term.grid().display_offset();
+    let rows = match hidden_from {
+        // Only the lines above the prompt. At the bottom of the grid they fill
+        // the screen from above, so the frame may be shorter than the screen.
+        Some(prompt) => {
+            let top = if term.grid().display_offset() == 0 {
+                prompt.saturating_sub(screen)
+            } else {
+                top
+            };
+            blocks::frame_rows(all, top, prompt, screen)
+        }
+        None => blocks::frame_rows(all, top, history + screen, screen),
+    };
+    let columns = term.columns();
+    let content = term.renderable_content();
+    let selection = content.selection;
+
+    let mut cells = Vec::with_capacity(rows.len() * columns);
+    let mut headers = Vec::new();
+    for (line, row) in rows.iter().enumerate() {
+        match *row {
+            Row::Line(buffer_line) => {
+                let grid_line = Line(buffer_line as i32 - history as i32);
+                for column in 0..columns {
+                    let cell = &term.grid()[grid_line][Column(column)];
+                    cells.push(SnapshotCell {
+                        line,
+                        column,
+                        c: cell.c,
+                        zerowidth: cell.zerowidth().map(Box::from),
+                        fg: cell.fg,
+                        bg: cell.bg,
+                        flags: cell.flags,
+                        selected: selection
+                            .is_some_and(|s| s.contains(Point::new(grid_line, Column(column)))),
+                    });
+                }
+            }
+            Row::Header(id) => {
+                headers.extend(all.iter().find(|block| block.id == id).cloned());
+                cells.extend((0..columns).map(|column| blank_cell(line, column)));
+            }
+        }
+    }
+
+    let cursor_line = history + content.cursor.point.line.0 as usize;
+    let cursor_row = rows.iter().position(|row| *row == Row::Line(cursor_line));
+    let cursor = Cursor {
+        line: cursor_row.unwrap_or(0),
+        column: content.cursor.point.column.0,
+        visible: hidden_from.is_none()
+            && cursor_row.is_some()
+            && content.cursor.shape != CursorShape::Hidden,
+        shape: content.cursor.shape,
+    };
+    let sticky = match rows.first() {
+        Some(Row::Line(line)) => blocks::block_containing_output(all, *line).cloned(),
+        _ => None,
+    };
+
+    let selected = selected.and_then(|id| selected_rows(all, &rows, id));
+    Frame {
+        rows,
+        columns,
+        cells,
+        cursor,
+        headers,
+        sticky,
+        selected,
+    }
+}
+
 /// The visual rows that belong to block `id`: its header row, and the rows
 /// of its output. `None` for a block that is unknown, still running, or not in
 /// `rows`.
@@ -973,6 +1011,66 @@ mod tests {
     fn osc_52_read_request_is_not_answered() {
         let events = events_for(b"\x1b]52;c;?\x07");
         assert!(events.is_empty());
+    }
+
+    /// A state fed with `bytes`, for frames without a shell. The screen is 80
+    /// columns and 6 rows.
+    fn state_for(bytes: &[u8]) -> State {
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(std::io::sink())));
+        let listener: Listener = Arc::new(|_| {});
+        let mut state = State {
+            term: Term::new(
+                Config::default(),
+                &TermSize::new(80, 6),
+                PtyResponder { writer, listener },
+            ),
+            blocks: Blocks::default(),
+            scrollback: Scrollback::default(),
+        };
+        let mut parser = Processor::new();
+        process(&mut state, &mut parser, &mut Scanner::default(), bytes);
+        state
+    }
+
+    /// One finished command, `ls`, with two output lines, then the live prompt
+    /// on line 3.
+    const ONE_COMMAND: &[u8] = b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C;ls\x07a\r\nb\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07";
+
+    #[test]
+    fn hidden_prompt_stops_the_rows_at_its_mark() {
+        let mut state = state_for(ONE_COMMAND);
+        let id = state.blocks.all()[0].id;
+        let frame = frame_of(&mut state, None, true);
+        // Lines 0 to 2 are drawn, the prompt on line 3 is not. The frame is
+        // shorter than the screen, and the cursor is not drawn.
+        assert_eq!(
+            frame.rows,
+            vec![Row::Header(id), Row::Line(1), Row::Line(2)]
+        );
+        assert_eq!(frame.cells.len(), 3 * 80);
+        assert!(!frame.cursor.visible);
+
+        let frame = frame_of(&mut state, None, false);
+        assert_eq!(frame.rows.len(), 6);
+        assert!(frame.rows.contains(&Row::Line(3)));
+    }
+
+    #[test]
+    fn running_command_has_a_header_row() {
+        let mut state = state_for(b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C;ls\x07a\r\n");
+        let id = state.blocks.all()[0].id;
+        let frame = frame_of(&mut state, None, true);
+        assert_eq!(frame.rows[0], Row::Header(id));
+        assert_eq!(frame.headers.len(), 1);
+        assert!(frame.rows.contains(&Row::Line(2)));
+        assert_eq!(frame.rows.len(), 6);
+    }
+
+    #[test]
+    fn docked_prompt_without_a_command_draws_no_rows() {
+        let mut state = state_for(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert!(frame_of(&mut state, None, true).rows.is_empty());
+        assert_eq!(frame_of(&mut state, None, false).rows.len(), 6);
     }
 
     #[test]

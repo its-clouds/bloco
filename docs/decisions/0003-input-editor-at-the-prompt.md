@@ -1,6 +1,6 @@
 # ADR 0003 — Input editor at the prompt
 
-- **Status:** Accepted
+- **Status:** Accepted; decision 1 superseded by ADR 0004
 - **Date:** 2026-11-02
 - **Resolves:** [open question 3](../open-questions.md#3-prompt-rendering-in-the-input-editor)
   and the mode machine in [architecture.md](../architecture.md#session-mode-state-machine)

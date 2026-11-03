@@ -648,7 +648,9 @@ mod tests {
     fn derived_chrome_follows_the_background() {
         let theme = parse_itermcolors(&itermcolors("ffffff")).unwrap().into_theme("white");
         assert_eq!(theme.name, "white");
-        assert_eq!(theme.chrome.tab_active, theme.background);
+        // The active tab is a step from the background toward the foreground,
+        // so its pill shows on the tab bar.
+        assert!(theme.chrome.tab_active.0 < theme.background.0);
         // The tab bar is darker than a white background.
         assert!(theme.chrome.tab_bar.0 < theme.background.0);
     }

@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gpui::Hsla;
+use gpui::{Hsla, Pixels, Point, point};
 use input_editor::completion::{Item, Specs};
 use input_editor::{Buffer, History, HistorySearch, Kind, Span, Walk, highlight, position, wrap};
 use term_session::{Color, NamedColor};
@@ -30,7 +30,7 @@ pub struct EditorDraw {
 /// Rows the completion menu shows at once. The rest scroll with the selection.
 pub const MENU_ROWS: usize = 8;
 
-/// The completion menu under the editor: the candidates and the selected one.
+/// The completion menu over the dock's editor: the candidates and the selected one.
 /// It is only open with two or more candidates. A single one is inserted.
 pub struct Menu {
     /// The char index where the word being completed starts.
@@ -65,6 +65,18 @@ impl Menu {
     }
 }
 
+/// Where the dock's editor is on screen, in window pixels. The element writes
+/// it on each frame that draws the editor, and the mouse handlers read it.
+#[derive(Debug, Clone, Copy)]
+pub struct EditorGeometry {
+    /// The top-left corner of the editor's first cell.
+    pub origin: Point<Pixels>,
+    /// Cells per editor row: the grid's column count.
+    pub columns: usize,
+    pub cell_width: Pixels,
+    pub line_height: Pixels,
+}
+
 pub struct PromptState {
     pub buffer: Buffer,
     pub history: History,
@@ -72,10 +84,8 @@ pub struct PromptState {
     pub walk: Walk,
     /// The Ctrl+R search, while it is open.
     pub search: Option<HistorySearch>,
-    /// Where the editor starts on screen: (line, column) of the shell's cursor
-    /// in the last frame that drew the editor. `None` when it is not drawn.
-    /// The element writes it, and the mouse handlers read it.
-    pub origin: Rc<Cell<Option<(usize, usize)>>>,
+    /// Where the editor is drawn, `None` when it is not. See [`EditorGeometry`].
+    pub geometry: Rc<Cell<Option<EditorGeometry>>>,
     /// The specs that answer Tab. See `completion.rs`.
     pub specs: Arc<Specs>,
     /// The completion menu, while it is open.
@@ -89,7 +99,7 @@ impl PromptState {
             history: load_history(),
             walk: Walk::default(),
             search: None,
-            origin: Rc::new(Cell::new(None)),
+            geometry: Rc::new(Cell::new(None)),
             specs: Arc::new(input_editor::completion::builtin()),
             menu: None,
         }
@@ -153,28 +163,26 @@ pub fn runs(spans: &[Span], range: Range<usize>) -> Vec<Run> {
 /// The colour of a highlighted span. Text with no kind uses the foreground.
 pub fn color(kind: Option<Kind>, palette: &Palette) -> Hsla {
     match kind {
-        Some(Kind::Command) | Some(Kind::Keyword) => palette.chrome.accent,
-        Some(Kind::String) => palette.resolve(Color::Named(NamedColor::Green)),
-        Some(Kind::Variable) => palette.resolve(Color::Named(NamedColor::Cyan)),
-        Some(Kind::Option) | Some(Kind::Comment) => palette.chrome.muted,
-        Some(Kind::Operator) | None => palette.foreground,
+        Some(Kind::Command) => palette.resolve(Color::Named(NamedColor::Green)),
+        Some(Kind::Keyword) | Some(Kind::Operator) => palette.chrome.accent,
+        Some(Kind::Option) => palette.resolve(Color::Named(NamedColor::Cyan)),
+        Some(Kind::String) => palette.resolve(Color::Named(NamedColor::Yellow)),
+        Some(Kind::Variable) => palette.resolve(Color::Named(NamedColor::Magenta)),
+        Some(Kind::Comment) => palette.chrome.muted,
+        None => palette.foreground,
     }
 }
 
-/// The editor's cursor on screen, as (line, column). `origin` is where the
-/// editor starts (see [`PromptState::origin`]). The text wraps at `columns` the
-/// same way the element draws it.
-pub fn cursor_cell(
-    origin: (usize, usize),
-    text: &str,
-    cursor: usize,
-    columns: usize,
-) -> (usize, usize) {
+/// The top-left corner of the editor's cursor cell, in window pixels. The text
+/// wraps at the dock's column count the same way the element draws it.
+pub fn cursor_point(geometry: EditorGeometry, text: &str, cursor: usize) -> Point<Pixels> {
     let chars: Vec<char> = text.chars().collect();
-    let rows = wrap(&chars, columns.saturating_sub(origin.1), columns);
+    let rows = wrap(&chars, geometry.columns, geometry.columns);
     let (row, column) = position(&rows, cursor);
-    let at = if row == 0 { origin.1 + column } else { column };
-    (origin.0 + row, at)
+    point(
+        geometry.origin.x + geometry.cell_width * column as f32,
+        geometry.origin.y + geometry.line_height * row as f32,
+    )
 }
 
 /// Whether a key types text into the editor. Enter, Tab and Backspace also carry
@@ -231,6 +239,7 @@ fn history_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use input_editor::{Kind, highlight};
+    use gpui::px;
 
     fn menu(count: usize) -> Menu {
         let items = (0..count)
@@ -269,18 +278,27 @@ mod tests {
         assert_eq!(menu(3).visible(), 0..3);
     }
 
-    #[test]
-    fn cursor_cell_is_the_origin_plus_the_typed_text() {
-        assert_eq!(cursor_cell((5, 2), "abc", 3, 80), (5, 5));
-        assert_eq!(cursor_cell((5, 2), "abc", 1, 80), (5, 3));
+    fn geometry(columns: usize) -> EditorGeometry {
+        EditorGeometry {
+            origin: point(px(100.), px(50.)),
+            columns,
+            cell_width: px(8.),
+            line_height: px(20.),
+        }
     }
 
     #[test]
-    fn cursor_cell_wraps_onto_the_next_row() {
-        // The first row has 78 columns after the origin at column 2, so char 80
-        // is on the second row, at column 2 of the editor's rows.
+    fn cursor_point_is_the_origin_plus_the_typed_text() {
+        assert_eq!(cursor_point(geometry(80), "abc", 3), point(px(124.), px(50.)));
+        assert_eq!(cursor_point(geometry(80), "abc", 1), point(px(108.), px(50.)));
+    }
+
+    #[test]
+    fn cursor_point_wraps_onto_the_next_row() {
+        // The dock's rows are 80 columns wide, so char 82 is at column 2 of the
+        // second row.
         let text = "x".repeat(90);
-        assert_eq!(cursor_cell((5, 2), &text, 80, 80), (6, 2));
+        assert_eq!(cursor_point(geometry(80), &text, 82), point(px(116.), px(70.)));
     }
 
     #[test]

@@ -17,6 +17,9 @@ const FILE: &str = "layout.json";
 pub struct SavedLayout {
     pub tabs: Vec<SavedTab>,
     pub active_tab: usize,
+    /// The sidebar's width in pixels. `None` in a layout saved before it was kept.
+    #[serde(default)]
+    pub sidebar_width: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -91,6 +94,7 @@ mod tests {
                 },
             ],
             active_tab: 1,
+            sidebar_width: Some(300.0),
         }
     }
 
@@ -99,6 +103,18 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bloco-layout-{}", std::process::id()));
         save(&dir, &sample()).unwrap();
         assert_eq!(load(&dir), Some(sample()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_layout_saved_before_the_sidebar_width_still_loads() {
+        let dir = std::env::temp_dir().join(format!("bloco-old-layout-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let old = r#"{"tabs":[{"root":{"kind":"pane","cwd":"/tmp/a"},"active":0}],"active_tab":0}"#;
+        fs::write(dir.join(FILE), old).unwrap();
+        let layout = load(&dir).expect("an old layout file loads");
+        assert_eq!(layout.sidebar_width, None);
+        assert_eq!(layout.tabs.len(), 1);
         let _ = fs::remove_dir_all(&dir);
     }
 

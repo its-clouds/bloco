@@ -6,6 +6,7 @@ mod colors;
 mod commands;
 mod completion;
 mod find;
+mod git;
 mod prompt;
 mod keys;
 mod layout;
@@ -20,7 +21,10 @@ mod terminal_view;
 mod workspace;
 mod zoom;
 
-use gpui::{App, AppContext, Bounds, Menu, MenuItem, WindowBounds, WindowOptions, px, size};
+use gpui::{
+    App, AppContext, Bounds, Menu, MenuItem, TitlebarOptions, WindowBounds, WindowOptions, point,
+    px, size,
+};
 use gpui_platform::application;
 
 use commands::{
@@ -80,6 +84,12 @@ fn main() {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                // The tab bar is the title bar, so the system one is transparent.
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Bloco".into()),
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(12.), px(13.))),
+                }),
                 ..Default::default()
             },
             |window, cx| cx.new(|cx| Workspace::new(window, cx)),

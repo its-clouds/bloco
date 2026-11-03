@@ -175,7 +175,7 @@ mod tests {
                     "{name}"
                 );
                 // The finished block is drawn with a header row for its prompt and command.
-                let frame = session.frame(None);
+                let frame = session.frame(None, false);
                 assert!(
                     frame.rows.contains(&Row::Header(block.id)),
                     "{name}: {:?}",
@@ -264,13 +264,13 @@ mod tests {
         let output = first.output_line.unwrap();
 
         session.scroll_top_to(output + 10);
-        let frame = session.frame(None);
+        let frame = session.frame(None, false);
         assert_eq!(frame.rows[0], Row::Line(output + 10));
         assert_eq!(frame.sticky.as_ref().map(|b| b.id), Some(first.id));
 
         session.toggle_block(first.id);
         session.scroll_top_to(first.prompt_line.unwrap());
-        let frame = session.frame(None);
+        let frame = session.frame(None, false);
         assert_eq!(frame.rows[0], Row::Header(first.id), "{:?}", frame.rows);
         assert!(
             !frame.rows.contains(&Row::Line(output + 1)),
@@ -312,7 +312,7 @@ mod tests {
         assert_eq!(session.block_output(blocks[2].id), Some(output(30)));
         assert_eq!(session.block_output(blocks[3].id), Some("hi".into()));
         assert!(session
-            .frame(None)
+            .frame(None, false)
             .rows
             .contains(&Row::Header(blocks[3].id)));
     }
@@ -355,7 +355,7 @@ mod tests {
         // The view cannot scroll above the scrollback, so this block stays where
         // it is on screen, with its header drawn and selected.
         session.scroll_top_to(previous.prompt_line.unwrap());
-        let frame = session.frame(Some(previous.id));
+        let frame = session.frame(Some(previous.id), false);
         assert!(frame.rows.contains(&Row::Header(previous.id)));
         assert!(frame.selected.is_some());
         // The block before it lost its header to the full scrollback.
@@ -395,7 +395,7 @@ mod tests {
                 "output of {command}"
             );
             session.scroll_top_to(block.prompt_line.unwrap());
-            let frame = session.frame(None);
+            let frame = session.frame(None, false);
             assert!(
                 frame.rows.contains(&Row::Header(block.id)),
                 "header of {command}: {:?}",
@@ -465,7 +465,7 @@ mod tests {
         let seq_block = &blocks[2];
         session.toggle_block(seq_block.id);
         session.scroll_top_to(seq_block.prompt_line.unwrap());
-        let frame = session.frame(None);
+        let frame = session.frame(None, false);
         assert!(
             frame.rows.contains(&Row::Header(seq_block.id)),
             "{:?}",

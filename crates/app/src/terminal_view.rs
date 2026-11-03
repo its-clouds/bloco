@@ -14,16 +14,18 @@ use std::time::Duration;
 use async_channel::Receiver;
 use config::OptionAsMeta;
 use gpui::{
-    AnyElement, App, Bounds, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    Anchor, AnyElement, App, Bounds, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
     InputHandler, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, Point, Render, ScrollEvent, SharedString, Task, UTF16Selection, Window,
     anchored, deferred, div, prelude::*, px, relative,
 };
 use input_editor::completion::{Completion, Item};
 use input_editor::{Buffer, HistorySearch, wrap};
-use term_session::{Block, FindQuery, Link, Row, SelectionKind, Session, SessionEvent, TermMode};
+use term_session::{
+    Block, FindQuery, InputMode, Link, Row, SelectionKind, Session, SessionEvent, TermMode,
+};
 
-use crate::block_header::shorten;
+use crate::block_header::{display_dir, shorten};
 use crate::colors::Palette;
 use crate::commands::{
     BlockCopyCommand, BlockCopyOutput, BlockNext, BlockPrevious, BlockToggleCollapse,
@@ -33,11 +35,12 @@ use crate::commands::{
 };
 use crate::completion;
 use crate::find::{FindState, Pick};
+use crate::git;
 use crate::keys::{TextEdit, text_edit_bytes, text_edit_for, to_esc_str};
 use crate::mouse::{alt_scroll, mouse_button_report, mouse_moved_report, scroll_report};
 use crate::option_key::option_keys_down;
 use crate::prompt::{self, Menu, PromptState, is_text_input, submit_bytes};
-use crate::terminal_element::{Metrics, TerminalElement, cell_metrics, grid_size};
+use crate::terminal_element::{Metrics, PromptContext, TerminalElement, cell_metrics, grid_size};
 
 /// What a pane tells its workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +123,12 @@ pub struct TerminalView {
     prompt: PromptState,
     /// The completion lookup in flight. Replaced by the next Tab.
     completion_task: Option<Task<()>>,
+    /// The shell's directory and the branch, as of the last prompt. Read when
+    /// the prompt comes back, never per frame. See `refresh_prompt_context`.
+    prompt_cwd: Option<PathBuf>,
+    context: Option<PromptContext>,
+    /// The keyboard owner as of the last output, to see the prompt come back.
+    last_mode: InputMode,
 }
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
@@ -171,6 +180,9 @@ impl TerminalView {
             layout: Rc::new(RefCell::new(Vec::new())),
             selected_block: Cell::new(None),
             prompt: PromptState::new(),
+            prompt_cwd: None,
+            context: None,
+            last_mode: InputMode::default(),
         };
         view.restart_cursor_blink(cx);
         view
@@ -228,7 +240,12 @@ impl TerminalView {
             return;
         }
         let (cell_width, line_height) = cell_metrics(cx, &self.font_family, self.font_size);
-        let (columns, rows) = grid_size(metrics.size, cell_width, line_height);
+        let (columns, rows) = grid_size(
+            metrics.size,
+            cell_width,
+            line_height,
+            self.session.docked(),
+        );
         if (columns, rows) != (metrics.columns, metrics.rows) {
             let _ = self.session.resize(columns as u16, rows as u16);
         }
@@ -251,6 +268,38 @@ impl TerminalView {
         tab_label(&self.session)
     }
 
+    /// The git branch of the shell's directory, as of the last prompt. `None`
+    /// outside a repository. Read from the cached prompt context, not from disk.
+    pub fn branch(&self) -> Option<String> {
+        self.context.as_ref().and_then(|context| context.branch.clone())
+    }
+
+    /// Whether a command is running in the pane.
+    pub fn is_running(&self) -> bool {
+        self.session.input_mode() == InputMode::Running
+    }
+
+    /// Refreshes the cached directory and branch when the shell is at a prompt
+    /// and either the directory changed or a command has finished since the last
+    /// prompt. The branch is read from disk, so this is not done per frame.
+    fn refresh_prompt_context(&mut self) {
+        let mode = self.session.input_mode();
+        let back_at_prompt = mode == InputMode::Prompt && self.last_mode != InputMode::Prompt;
+        self.last_mode = mode;
+        if mode != InputMode::Prompt {
+            return;
+        }
+        let cwd = self.session.cwd();
+        if !back_at_prompt && cwd == self.prompt_cwd {
+            return;
+        }
+        self.context = cwd.as_deref().map(|dir| PromptContext {
+            dir: display_dir(dir),
+            branch: git::branch(dir),
+        });
+        self.prompt_cwd = cwd;
+    }
+
     fn handle_session_event(&mut self, event: SessionEvent, cx: &mut Context<Self>) {
         match event {
             SessionEvent::Output => {
@@ -259,6 +308,7 @@ impl TerminalView {
                     self.tab_label = label;
                     cx.emit(TerminalEvent::TabTitleChanged);
                 }
+                self.refresh_prompt_context();
                 self.schedule_find_refresh(cx);
                 cx.notify();
             }
@@ -615,7 +665,7 @@ impl TerminalView {
             .whitespace_nowrap()
             .child(
                 div()
-                    .when(empty, |d| d.text_color(chrome.muted).child("Find"))
+                    .when(empty, |d| d.text_color(chrome.muted).child("Find in terminal"))
                     .when(!empty, |d| d.child(find.query.text.clone()))
                     .when(find.all_selected, |d| d.bg(self.palette.selection)),
             )
@@ -628,7 +678,7 @@ impl TerminalView {
                 .id(id)
                 .flex_shrink_0()
                 .px_1()
-                .rounded_sm()
+                .rounded(px(4.))
                 .cursor_pointer()
                 .text_color(if on { chrome.accent } else { chrome.muted })
                 .when(on, |d| d.bg(chrome.selected))
@@ -640,7 +690,7 @@ impl TerminalView {
                 .id(id)
                 .flex_shrink_0()
                 .px_1()
-                .rounded_sm()
+                .rounded(px(4.))
                 .cursor_pointer()
                 .text_color(chrome.muted)
                 .hover(|d| d.bg(chrome.close_hover).text_color(chrome.text))
@@ -651,21 +701,22 @@ impl TerminalView {
             div()
                 .id("find-bar")
                 .absolute()
-                .top(px(6.))
-                .right(px(12.))
+                .top(px(10.))
+                .right(px(14.))
                 .w(px(FIND_BAR_WIDTH))
                 .max_w(relative(0.9))
                 .flex()
                 .items_center()
                 .gap_1()
                 .px_2()
-                .py_1()
+                .py_1p5()
                 .text_sm()
                 .bg(chrome.overlay)
                 .text_color(chrome.text)
                 .border_1()
                 .border_color(if find.invalid { chrome.error } else { chrome.divider })
-                .rounded_md()
+                .rounded(px(8.))
+                .shadow_lg()
                 .track_focus(&self.find_focus)
                 .key_context("FindBar")
                 .on_key_down(cx.listener(Self::find_key))
@@ -710,6 +761,7 @@ impl TerminalView {
                     div()
                         .flex_shrink_0()
                         .min_w(px(64.))
+                        .text_size(px(12.))
                         .text_color(if find.invalid { chrome.error } else { chrome.muted })
                         .child(find.counter()),
                 )
@@ -750,8 +802,13 @@ impl TerminalView {
         if event.button == MouseButton::Left
             && !event.modifiers.shift
             && self.owns_input()
-            && self.place_cursor(line, column)
+            && self.place_cursor(event.position)
         {
+            cx.notify();
+            return;
+        }
+        // The dock is not the grid: a click there never starts a selection.
+        if metrics.dock_top.is_some_and(|top| event.position.y >= top) {
             cx.notify();
             return;
         }
@@ -1275,20 +1332,18 @@ impl TerminalView {
         self.edit_buffer(|buffer| buffer.replace_before(typed, &text));
     }
 
-    /// The completion menu, under the editor's cursor. Drawn while the editor
+    /// The completion menu, above the editor's cursor in the dock. Drawn while the editor
     /// owns the keys and the menu is open.
     fn render_completion_menu(&self) -> Option<AnyElement> {
         let menu = self.prompt.menu.as_ref()?;
         if !self.owns_input() {
             return None;
         }
-        let origin = self.prompt.origin.get()?;
-        let metrics = self.metrics.get();
+        let geometry = self.prompt.geometry.get()?;
         let buffer = &self.prompt.buffer;
-        let (line, column) =
-            prompt::cursor_cell(origin, &buffer.text(), buffer.cursor(), metrics.columns);
-        // The menu opens on the row below the cursor.
-        let anchor = metrics.cell_bounds(line + 1, column, 1).origin;
+        // The dock sits at the bottom of the pane, so the menu opens upward
+        // from the top of the cursor's row.
+        let anchor = prompt::cursor_point(geometry, &buffer.text(), buffer.cursor());
         let chrome = &self.palette.chrome;
         let rows = menu.visible().map(|index| {
             let item = &menu.items[index];
@@ -1315,7 +1370,10 @@ impl TerminalView {
         });
         Some(
             deferred(
-                anchored().position(anchor).snap_to_window().child(
+                anchored()
+                    .anchor(Anchor::BottomLeft)
+                    .position(anchor)
+                    .snap_to_window().child(
                     div()
                         .id("completion-menu")
                         .flex()
@@ -1337,26 +1395,28 @@ impl TerminalView {
         )
     }
 
-    /// Moves the editor's cursor to a click on the editor. Returns false when the
-    /// click is not on the editor, so the pane handles it as before.
-    fn place_cursor(&mut self, line: usize, column: usize) -> bool {
+    /// Moves the editor's cursor to a click on the editor's rows in the dock.
+    /// Returns false when the click is not on them, so the dock ignores it.
+    fn place_cursor(&mut self, position: Point<Pixels>) -> bool {
         if self.prompt.search.is_some() {
             return false;
         }
-        let Some((origin_line, origin_column)) = self.prompt.origin.get() else {
+        let Some(geometry) = self.prompt.geometry.get() else {
             return false;
         };
-        let Some(row) = line.checked_sub(origin_line) else {
+        let y = f32::from(position.y - geometry.origin.y);
+        if y < 0.0 {
             return false;
-        };
-        let columns = self.metrics.get().columns;
+        }
+        let x = f32::from(position.x - geometry.origin.x).max(0.0);
+        let row = (y / f32::from(geometry.line_height)) as usize;
+        let column = (x / f32::from(geometry.cell_width)) as usize;
         let chars: Vec<char> = self.prompt.buffer.text().chars().collect();
-        let rows = wrap(&chars, columns.saturating_sub(origin_column), columns);
+        let rows = wrap(&chars, geometry.columns, geometry.columns);
         let Some(range) = rows.get(row) else {
             return false;
         };
-        let start = if row == 0 { origin_column } else { 0 };
-        let offset = column.saturating_sub(start).min(range.len());
+        let offset = column.min(range.len());
         self.prompt.buffer.set_cursor(range.start + offset);
         true
     }
@@ -1446,7 +1506,9 @@ impl Render for TerminalView {
                 rows: self.layout.clone(),
                 selected: self.selected_block.get(),
                 editor: self.owns_input().then(|| self.prompt.draw()),
-                editor_origin: self.prompt.origin.clone(),
+                editor_geometry: self.prompt.geometry.clone(),
+                context: self.context.clone(),
+                running: self.session.input_mode() == InputMode::Running,
             })
             .children(find_bar)
             .children(self.render_completion_menu())

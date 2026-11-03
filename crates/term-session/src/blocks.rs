@@ -1,8 +1,9 @@
 //! Command block records, built from OSC 133 marks, and the rows a frame shows.
 //!
 //! A block's positions are buffer lines (see [`BufferPoint`]), taken from the
-//! cursor when the mark arrives. A finished block shows one header row in place
-//! of its prompt and command lines. A collapsed block also hides its output.
+//! cursor when the mark arrives. A block shows one header row in place of its
+//! prompt and command lines, while it runs and after it finishes. A collapsed
+//! block also hides its output.
 
 use std::ops::Range;
 use std::path::PathBuf;
@@ -48,17 +49,21 @@ impl Block {
     }
 
     /// The lines of a block that is drawn as a block: its header lines, and the
-    /// output lines that a collapsed block hides. `None` for a running block,
-    /// or one whose lines are unknown, which is drawn as plain rows.
+    /// output lines that a collapsed block hides. A running block has a header
+    /// and hides nothing. `None` when the lines are unknown, which is drawn as
+    /// plain rows.
     fn fold(&self) -> Option<Fold> {
         let prompt = self.prompt_line?;
         let output = self.output_line?;
-        let end = self.end_line?;
-        self.finished_at?;
+        let end = match self.end_line {
+            Some(end) => end,
+            None if self.finished_at.is_none() => output,
+            None => return None,
+        };
         if prompt >= output || output > end {
             return None;
         }
-        let hidden = if self.collapsed {
+        let hidden = if self.collapsed && self.end_line.is_some() {
             output..end
         } else {
             output..output
@@ -82,6 +87,9 @@ pub struct Blocks {
     next_id: u64,
     /// The buffer line where the current prompt was drawn.
     prompt_line: Option<usize>,
+    /// A prompt mark (`B`) has come. Until then the shell may not print one, so
+    /// the input is not docked.
+    prompt_seen: bool,
     /// The directory the shell reported last (OSC 7).
     cwd: Option<PathBuf>,
     /// Who owns the keyboard, from the marks seen so far.
@@ -97,7 +105,7 @@ impl Blocks {
         self.input = self.input.after(&mark);
         match mark {
             Mark::PromptStart => self.prompt_line = at.map(|p| p.line),
-            Mark::PromptEnd => {}
+            Mark::PromptEnd => self.prompt_seen = true,
             Mark::CommandStart { command } => {
                 let id = self.next_id;
                 self.next_id += 1;
@@ -133,15 +141,27 @@ impl Blocks {
         }
     }
 
-    /// Forgets where the blocks are. Used when the buffer no longer matches the
-    /// recorded lines and they cannot be followed, which is when the scrollback
-    /// counts were lost. The blocks stay, and their output is drawn as plain rows.
     /// Who owns the keyboard, from the marks alone. The alternate screen is
     /// not part of this; see [`InputMode::effective`].
     pub fn input_mode(&self) -> InputMode {
         self.input
     }
 
+    /// Whether a prompt mark (`B`) has come, ever. A shell without it (fish, or
+    /// no integration) never gets a docked input.
+    pub fn prompt_seen(&self) -> bool {
+        self.prompt_seen
+    }
+
+    /// The buffer line where the shell's live prompt starts: from its `A` mark
+    /// until the command runs (`C`). `None` otherwise.
+    pub fn live_prompt_line(&self) -> Option<usize> {
+        self.prompt_line
+    }
+
+    /// Forgets where the blocks are. Used when the buffer no longer matches the
+    /// recorded lines and they cannot be followed, which is when the scrollback
+    /// counts were lost. The blocks stay, and their output is drawn as plain rows.
     pub fn forget_positions(&mut self) {
         for line in self.lines_mut() {
             *line = None;
@@ -203,14 +223,15 @@ impl Blocks {
         self.cwd.as_ref()
     }
 
-    /// Shows or hides the output of block `id`. Returns `false` for an unknown id.
+    /// Shows or hides the output of block `id`. Returns `false` for an unknown
+    /// id, or for a block that is still running (its output cannot be hidden yet).
     pub fn toggle_collapsed(&mut self, id: u64) -> bool {
         match self.list.iter_mut().find(|b| b.id == id) {
-            Some(block) => {
+            Some(block) if block.finished_at.is_some() => {
                 block.collapsed = !block.collapsed;
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 }
@@ -220,15 +241,15 @@ impl Blocks {
 pub enum Row {
     /// A buffer line, drawn as it is.
     Line(usize),
-    /// The header of the finished block with this id.
+    /// The header of the block with this id.
     Header(u64),
 }
 
 /// The visual rows for buffer lines `first..=last`, top first.
 ///
-/// A finished block takes one header row in place of its prompt and command
-/// lines. A collapsed block's output lines take no row. A block that has not
-/// finished takes no header, so its command runs as plain rows.
+/// A block takes one header row in place of its prompt and command lines, while
+/// it runs and after it finishes. A collapsed block's output lines take no row.
+/// A block whose lines are unknown takes no header, so its lines are plain rows.
 pub fn rows(blocks: &[Block], first: usize, last: usize) -> Vec<Row> {
     let folds: Vec<(&Block, Fold)> = blocks
         .iter()
@@ -268,6 +289,9 @@ pub fn rows(blocks: &[Block], first: usize, last: usize) -> Vec<Row> {
 /// buffer it takes them from above instead, so the newest line stays at the
 /// bottom.
 pub fn frame_rows(blocks: &[Block], top: usize, total: usize, height: usize) -> Vec<Row> {
+    if total == 0 {
+        return Vec::new();
+    }
     let mut first = top;
     let mut last = (top + height)
         .saturating_sub(1)
@@ -448,14 +472,37 @@ mod tests {
     }
 
     #[test]
-    fn running_block_is_plain_rows() {
+    fn running_block_has_a_header_row_and_hides_nothing() {
         let mut blocks = Blocks::default();
         blocks.apply(Mark::PromptStart, at(0, 0));
         blocks.apply(Mark::CommandStart { command: None }, at(1, 0));
+        let id = blocks.all()[0].id;
         assert_eq!(
             rows(blocks.all(), 0, 2),
-            vec![Row::Line(0), Row::Line(1), Row::Line(2)]
+            vec![Row::Header(id), Row::Line(1), Row::Line(2)]
         );
+        // A running block cannot be collapsed.
+        assert!(!blocks.toggle_collapsed(id));
+        assert_eq!(
+            rows(blocks.all(), 0, 2),
+            vec![Row::Header(id), Row::Line(1), Row::Line(2)]
+        );
+    }
+
+    #[test]
+    fn prompt_seen_and_live_prompt_line_follow_the_marks() {
+        let mut blocks = Blocks::default();
+        assert!(!blocks.prompt_seen());
+        blocks.apply(Mark::PromptStart, at(0, 0));
+        assert_eq!(blocks.live_prompt_line(), Some(0));
+        assert!(!blocks.prompt_seen());
+        blocks.apply(Mark::PromptEnd, at(0, 2));
+        assert!(blocks.prompt_seen());
+        blocks.apply(Mark::CommandStart { command: None }, at(0, 2));
+        // The command runs: no prompt is live, but the seen flag stays.
+        assert_eq!(blocks.live_prompt_line(), None);
+        blocks.apply(Mark::CommandEnd { exit_code: Some(0) }, at(1, 0));
+        assert!(blocks.prompt_seen());
     }
 
     #[test]

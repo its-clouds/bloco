@@ -11,15 +11,17 @@ const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
 pub struct Chrome {
     pub tab_bar: Hsla,
     pub tab_active: Hsla,
-    pub tab_inactive: Hsla,
+    pub tab_hover: Hsla,
     pub close_hover: Hsla,
     pub text: Hsla,
     pub muted: Hsla,
     pub divider: Hsla,
     pub overlay: Hsla,
+    pub surface: Hsla,
     pub selected: Hsla,
     pub accent: Hsla,
     pub error: Hsla,
+    pub success: Hsla,
 }
 
 pub struct Palette {
@@ -62,15 +64,17 @@ impl Palette {
             chrome: Chrome {
                 tab_bar: hsla(chrome.tab_bar),
                 tab_active: hsla(chrome.tab_active),
-                tab_inactive: hsla(chrome.tab_inactive),
+                tab_hover: hsla(chrome.tab_hover),
                 close_hover: hsla(chrome.close_hover),
                 text: hsla(chrome.text),
                 muted: hsla(chrome.muted),
                 divider: hsla(chrome.divider),
                 overlay: hsla(chrome.overlay),
+                surface: hsla(chrome.surface),
                 selected: hsla(chrome.selected),
                 accent: hsla(chrome.accent),
                 error: hsla(chrome.error),
+                success: hsla(chrome.success),
             },
         }
     }

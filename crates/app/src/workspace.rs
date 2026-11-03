@@ -18,9 +18,10 @@ use gpui::{
     Action, AnyElement, App, Bounds, Context, Entity, EntityId, FocusHandle, Focusable, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PathPromptOptions, Pixels, Render, Subscription, Window, WindowBackgroundAppearance, canvas, div, prelude::*, px, relative,
 };
-use term_session::{Session, SessionEvent};
+use term_session::{Color, NamedColor, Session, SessionEvent};
 
-use crate::colors::Palette;
+use crate::block_header::display_dir;
+use crate::colors::{Chrome, Palette};
 use crate::commands::{
     self, ClosePane, CloseTab, FocusDown, FocusLeft, FocusRight, FocusUp, ImportTheme, NewTab,
     NextTab, OpenSettings, PreviousTab, SelectTab, ShowFiles, ShowSessions, SplitDown, SplitRight,
@@ -29,21 +30,26 @@ use crate::commands::{
 use crate::layout::{self, SavedLayout, SavedNode, SavedTab};
 use crate::palette::{PaletteState, pretty_keys};
 use crate::settings::{self as settings_rows, Setting};
-use crate::sidebar::{self, Mode, Sidebar};
+use crate::sidebar::{self, Mode, SIDEBAR_WIDTH, Sidebar};
 use crate::split_tree::{Axis, DIVIDER, Direction, MAX_RATIO, MIN_RATIO, Node, Rect, SplitTree};
 use crate::terminal_view::{TerminalEvent, TerminalStyle, TerminalView};
 use crate::zoom;
 
 /// Used when the configured font is not installed.
 const FALLBACK_FONT: &str = "Menlo";
-const TAB_BAR_HEIGHT: f32 = 30.0;
-const PALETTE_WIDTH: f32 = 560.0;
-const PALETTE_TOP: f32 = 80.0;
+/// The title bar holds the tabs. It is always shown.
+const TAB_BAR_HEIGHT: f32 = 38.0;
+const TAB_HEIGHT: f32 = 26.0;
+/// Room on the left of the title bar for the macOS traffic lights.
+const TRAFFIC_LIGHT_PADDING: f32 = 90.0;
+/// The grab area around a divider. Wider than the 1px line it marks.
+const DIVIDER_GRAB: f32 = 7.0;
+/// The grab area over the sidebar's right edge. Same size as a divider's.
+const SIDEBAR_GRAB: f32 = 7.0;
+const PALETTE_WIDTH: f32 = 600.0;
+const PALETTE_TOP: f32 = 72.0;
 const PALETTE_ROWS: usize = 10;
 const SETTINGS_POLL: Duration = Duration::from_millis(500);
-const SIDEBAR_WIDTH: f32 = 240.0;
-/// The strip of buttons down the sidebar's left edge that picks the list.
-const ACTIVITY_WIDTH: f32 = 36.0;
 const SETTINGS_TOP: f32 = 60.0;
 const SETTINGS_WIDTH: f32 = 480.0;
 
@@ -100,6 +106,8 @@ pub struct Workspace {
     palette: Option<PaletteState>,
     palette_focus: FocusHandle,
     divider_drag: Option<DividerDrag>,
+    /// Whether the sidebar's edge is being dragged.
+    sidebar_drag: bool,
     /// The area that holds the panes, measured while painting.
     content_area: Rc<Cell<Bounds<Pixels>>>,
     /// The layout as last written to disk. Only a change is written again.
@@ -145,6 +153,7 @@ impl Workspace {
             palette: None,
             palette_focus: cx.focus_handle(),
             divider_drag: None,
+            sidebar_drag: false,
             content_area: Rc::new(Cell::new(Bounds::default())),
             last_saved: None,
             _quit: quit,
@@ -363,6 +372,23 @@ impl Workspace {
         }
     }
 
+    /// Follows the sidebar's edge while it is dragged. The sidebar starts at the
+    /// window's left edge, so the width is the mouse's x.
+    fn drag_sidebar(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.sidebar_drag {
+            return;
+        }
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.sidebar_drag = false;
+            return;
+        }
+        let width = sidebar::clamp_width(f32::from(event.position.x));
+        if width != self.sidebar.width {
+            self.sidebar.width = width;
+            cx.notify();
+        }
+    }
+
     fn toggle_palette(&mut self, _: &TogglePalette, window: &mut Window, cx: &mut Context<Self>) {
         if self.palette.is_some() {
             self.close_palette(window, cx);
@@ -488,6 +514,7 @@ impl Workspace {
                 })
                 .collect(),
             active_tab: self.active_tab,
+            sidebar_width: Some(self.sidebar.width),
         }
     }
 
@@ -519,6 +546,9 @@ impl Workspace {
         }
         self.tabs = tabs;
         self.active_tab = saved.active_tab.min(self.tabs.len() - 1);
+        if let Some(width) = saved.sidebar_width {
+            self.sidebar.width = sidebar::clamp_width(width);
+        }
         self.focus_active(window, cx);
         true
     }
@@ -777,24 +807,52 @@ impl Workspace {
         self.set_font_size(cx);
     }
 
+    /// The title bar: the sidebar toggle, then the tabs and the new-tab button.
+    /// With the Sessions list open the tabs are in the sidebar, so the bar shows
+    /// the active title instead. Its empty space drags the window, and a double
+    /// click zooms it. The tabs and buttons stop their mouse-downs, so clicking
+    /// them never drags.
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let chrome = &self.style.palette.chrome;
+        let sessions_open = self.sidebar.open && self.sidebar.mode == Mode::Sessions;
+        let toggle = self.render_sidebar_toggle(cx);
+        let title = self
+            .tabs
+            .get(self.active_tab)
+            .map(|tab| tab.active.read(cx).tab_title())
+            .unwrap_or_default();
         let tabs = self.tabs.iter().enumerate().map(|(index, tab)| {
             let active = index == self.active_tab;
             let title = tab.active.read(cx).tab_title();
+            // Each tab is its own group, so its close button shows only while that tab is hovered.
+            let group = format!("tab-{index}");
             div()
                 .id(("tab", index))
+                .group(group.clone())
                 .flex()
                 .items_center()
-                .h_full()
-                .pl_3()
-                .pr_1()
-                .min_w(px(120.))
-                .max_w(px(240.))
+                .h(px(TAB_HEIGHT))
+                .px_3()
+                .min_w(px(90.))
+                .max_w(px(200.))
+                .rounded(px(6.))
                 .overflow_hidden()
-                .bg(if active { chrome.tab_active } else { chrome.tab_inactive })
+                .text_size(px(13.))
+                .bg(if active { chrome.tab_active } else { chrome.tab_bar })
                 .text_color(if active { chrome.text } else { chrome.muted })
-                .when(active, |d| d.border_b_2().border_color(chrome.accent))
+                .when(!active, |d| {
+                    d.hover(|d| d.bg(chrome.tab_hover).text_color(chrome.text))
+                })
+                .child(
+                    // A terminal glyph in the terminal font, marking the tab as a shell.
+                    div()
+                        .flex_shrink_0()
+                        .mr_1p5()
+                        .font_family(self.style.font_family.clone())
+                        .text_size(px(11.))
+                        .text_color(if active { chrome.accent } else { chrome.muted })
+                        .child(">_"),
+                )
                 .child(
                     // The title shrinks and ends in an ellipsis before the close button.
                     div()
@@ -813,9 +871,16 @@ impl Workspace {
                         .justify_center()
                         .flex_shrink_0()
                         .ml_1()
-                        .size(px(18.))
-                        .rounded_sm()
+                        .size(px(16.))
+                        .rounded(px(4.))
                         .cursor_pointer()
+                        // Inactive tabs show their close button only when hovered.
+                        .text_color(if active {
+                            chrome.muted
+                        } else {
+                            gpui::transparent_black()
+                        })
+                        .group_hover(group, |style| style.text_color(chrome.muted))
                         .hover(|d| d.bg(chrome.close_hover).text_color(chrome.text))
                         .child("×")
                         .on_mouse_down(
@@ -830,6 +895,8 @@ impl Workspace {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |ws, _: &MouseDownEvent, window, cx| {
+                        // Stops here so the title bar does not start a window drag.
+                        cx.stop_propagation();
                         ws.select_tab(index, window, cx)
                     }),
                 )
@@ -843,24 +910,106 @@ impl Workspace {
         div()
             .flex()
             .flex_row()
+            .items_center()
             .flex_shrink_0()
             .h(px(TAB_BAR_HEIGHT))
+            .gap_1()
+            .px_2()
+            .when(cfg!(target_os = "macos"), |d| {
+                d.pl(px(TRAFFIC_LIGHT_PADDING))
+            })
             .bg(chrome.tab_bar)
-            .children(tabs)
+            .border_b_1()
+            .border_color(chrome.divider)
+            .on_mouse_down(MouseButton::Left, |event, window, _| {
+                if event.click_count == 2 {
+                    window.titlebar_double_click();
+                } else {
+                    window.start_window_move();
+                }
+            })
+            .child(toggle)
+            .when(sessions_open, |bar| {
+                bar.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_center()
+                        .text_size(px(12.))
+                        .text_color(chrome.muted)
+                        .child(title),
+                )
+            })
+            .when(!sessions_open, |bar| {
+                bar.children(tabs).child(
+                    div()
+                        .id("new-tab")
+                        .flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .justify_center()
+                        .size(px(24.))
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .text_color(chrome.muted)
+                        .hover(|d| d.bg(chrome.tab_hover).text_color(chrome.text))
+                        .child("+")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|ws, _: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                ws.new_tab(&NewTab, window, cx)
+                            }),
+                        ),
+                )
+            })
+    }
+
+    /// The sidebar toggle in the title bar. Drawn with divs: a small box with a
+    /// bar inside its left edge, in the accent colour while the sidebar is open.
+    /// Clicking it runs the same code as the toggle-sidebar action.
+    fn render_sidebar_toggle(&self, cx: &Context<Self>) -> impl IntoElement {
+        let chrome = &self.style.palette.chrome;
+        let color = if self.sidebar.open { chrome.accent } else { chrome.muted };
+        let icon = div()
+            .relative()
+            .w(px(14.))
+            .h(px(11.))
+            .rounded(px(3.))
+            .border(px(1.5))
+            .border_color(color)
             .child(
                 div()
-                    .id("new-tab")
-                    .flex()
-                    .items_center()
-                    .px_3()
-                    .text_color(chrome.muted)
-                    .child("+")
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|ws, _: &MouseDownEvent, window, cx| {
-                            ws.new_tab(&NewTab, window, cx)
-                        }),
-                    ),
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(3.))
+                    .w(px(1.5))
+                    .bg(color),
+            );
+        div()
+            .id("sidebar-toggle")
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .justify_center()
+            .ml_2()
+            .mr_0p5()
+            .size(px(24.))
+            .rounded(px(6.))
+            .cursor_pointer()
+            .hover(|d| d.bg(chrome.tab_hover))
+            .child(icon)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|ws, _: &MouseDownEvent, window, cx| {
+                    // The click must not reach the title bar, or it would start a window drag.
+                    cx.stop_propagation();
+                    ws.toggle_sidebar(&ToggleSidebar, window, cx)
+                }),
             )
     }
 
@@ -920,17 +1069,38 @@ impl Workspace {
                     .when(horizontal, |d| d.w(relative(ratio)).h_full())
                     .when(!horizontal, |d| d.h(relative(ratio)).w_full())
                     .child(self.render_node(first, first_path, cx));
-                let divider = div()
-                    .flex_shrink_0()
-                    .bg(self.style.palette.chrome.divider)
-                    .when(horizontal, |d| d.w(px(DIVIDER)).h_full().cursor_ew_resize())
-                    .when(!horizontal, |d| d.h(px(DIVIDER)).w_full().cursor_ns_resize())
+                // The hairline is the visible part. The wider transparent strip
+                // centred on it is what takes the mouse.
+                let grab_offset = -(DIVIDER_GRAB - DIVIDER) / 2.0;
+                let grab = div()
+                    .absolute()
+                    .when(horizontal, |d| {
+                        d.top_0()
+                            .bottom_0()
+                            .left(px(grab_offset))
+                            .w(px(DIVIDER_GRAB))
+                            .cursor_ew_resize()
+                    })
+                    .when(!horizontal, |d| {
+                        d.left_0()
+                            .right_0()
+                            .top(px(grab_offset))
+                            .h(px(DIVIDER_GRAB))
+                            .cursor_ns_resize()
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |ws, _: &MouseDownEvent, _, _| {
                             ws.divider_drag = Some(drag.clone());
                         }),
                     );
+                let divider = div()
+                    .relative()
+                    .flex_shrink_0()
+                    .bg(self.style.palette.chrome.divider)
+                    .when(horizontal, |d| d.w(px(DIVIDER)).h_full())
+                    .when(!horizontal, |d| d.h(px(DIVIDER)).w_full())
+                    .child(grab);
                 let second_el = div()
                     .flex_1()
                     .min_w_0()
@@ -953,7 +1123,7 @@ impl Workspace {
             return div().into_any_element();
         };
         let chrome = &self.style.palette.chrome;
-        let rows = state
+        let mut rows: Vec<AnyElement> = state
             .matches
             .iter()
             .take(PALETTE_ROWS)
@@ -966,16 +1136,14 @@ impl Workspace {
                     .flex_row()
                     .justify_between()
                     .items_center()
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
+                    .px_3()
+                    .py_1p5()
+                    .rounded(px(6.))
+                    .text_size(px(13.))
+                    .text_color(chrome.text)
                     .when(row == state.selected, |d| d.bg(chrome.selected))
                     .child(command.title)
-                    .child(
-                        div()
-                            .text_color(chrome.muted)
-                            .child(state.shortcuts[index].clone()),
-                    )
+                    .child(key_chips(&state.shortcuts[index], chrome))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |ws, _: &MouseDownEvent, window, cx| {
@@ -985,8 +1153,37 @@ impl Workspace {
                             ws.run_selected(window, cx);
                         }),
                     )
-            });
-        // The overlay covers the window: a click outside the card closes the palette.
+                    .into_any_element()
+            })
+            .collect();
+        if rows.is_empty() {
+            rows.push(
+                div()
+                    .px_3()
+                    .py_1p5()
+                    .text_size(px(13.))
+                    .text_color(chrome.muted)
+                    .child("No matching commands")
+                    .into_any_element(),
+            );
+        }
+        let query = if state.query.is_empty() {
+            // The caret sits in front of the placeholder when nothing is typed.
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .child(caret(chrome))
+                .child(div().text_color(chrome.muted).child("Search commands"))
+        } else {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .child(state.query.clone())
+                .child(caret(chrome))
+        };
+        // The overlay covers the window with a light dim: a click outside the card closes the palette.
         div()
             .absolute()
             .top_0()
@@ -995,6 +1192,7 @@ impl Workspace {
             .flex()
             .justify_center()
             .pt(px(PALETTE_TOP))
+            .bg(gpui::black().opacity(0.3))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|ws, _: &MouseDownEvent, window, cx| ws.close_palette(window, cx)),
@@ -1005,19 +1203,25 @@ impl Workspace {
                     .track_focus(&self.palette_focus)
                     .on_key_down(cx.listener(Self::palette_key))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .flex()
+                    .flex_col()
                     .w(px(PALETTE_WIDTH))
-                    .p_2()
                     .bg(chrome.overlay)
                     .border_1()
                     .border_color(chrome.divider)
-                    .rounded_md()
+                    .rounded(px(10.))
+                    .shadow_lg()
+                    .overflow_hidden()
                     .child(
                         div()
-                            .px_2()
-                            .py_1()
-                            .child(format!("> {}", state.query)),
+                            .px_4()
+                            .py_3()
+                            .text_size(px(14.))
+                            .border_b_1()
+                            .border_color(chrome.divider)
+                            .child(query),
                     )
-                    .children(rows),
+                    .child(div().p_1p5().children(rows)),
             )
             .into_any_element()
     }
@@ -1094,40 +1298,51 @@ impl Workspace {
 }
 
 impl Workspace {
-    /// The sidebar: the session list (vertical tabs) or the file tree, with a
-    /// switch between them in its header.
+    /// The sidebar: a switch between the session list and the file tree, then
+    /// the list. In Sessions mode the `+` beside the switch opens a tab.
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let chrome = &self.style.palette.chrome;
-        let (text, muted, selected, divider, close_hover) = (
+        let (text, muted, divider, close_hover) = (
             chrome.text,
             chrome.muted,
-            chrome.selected,
             chrome.divider,
             chrome.close_hover,
         );
         let mode = self.sidebar.mode;
-        let title = match mode {
-            Mode::Sessions => "Sessions",
-            Mode::Files => "Files",
-        };
         let header = div()
             .flex()
             .flex_row()
             .items_center()
-            .justify_between()
+            .gap(px(6.))
             .flex_shrink_0()
-            .h(px(TAB_BAR_HEIGHT))
-            .px_3()
-            .border_b_1()
-            .border_color(divider)
-            .child(div().text_color(muted).child(title))
+            .h(px(28.))
+            .mb(px(6.))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .p(px(2.))
+                    .rounded(px(6.))
+                    .bg(chrome.surface)
+                    .child(self.sidebar_segment("Sessions", Mode::Sessions, mode, cx))
+                    .child(self.sidebar_segment("Files", Mode::Files, mode, cx)),
+            )
             .when(mode == Mode::Sessions, |header| {
                 header.child(
                     div()
                         .id("sidebar-new-tab")
-                        .px_2()
-                        .text_color(muted)
+                        .flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .justify_center()
+                        .size(px(24.))
+                        .rounded(px(6.))
                         .cursor_pointer()
+                        .text_color(muted)
+                        .hover(|d| d.bg(chrome.tab_hover).text_color(text))
                         .child("+")
                         .on_mouse_down(
                             MouseButton::Left,
@@ -1147,18 +1362,54 @@ impl Workspace {
                     let active = index == self.active_tab;
                     let pane = tab.active.read(cx);
                     let title = pane.tab_title();
-                    let detail = pane.cwd().map(|dir| dir_label(&dir)).unwrap_or_default();
+                    let running = pane.is_running();
+                    let branch = pane.branch();
+                    // The directory's name, or its full path when that name is the title.
+                    let dir = match pane.cwd() {
+                        Some(dir) if dir_label(&dir) == title => display_dir(&dir),
+                        Some(dir) => dir_label(&dir),
+                        None => String::new(),
+                    };
+                    // Yellow while a command runs, the accent on the active row, muted otherwise.
+                    let badge_text = if running {
+                        self.style.palette.resolve(Color::Named(NamedColor::Yellow))
+                    } else if active {
+                        chrome.accent
+                    } else {
+                        muted
+                    };
+                    // Each row is its own group, so its close button shows only while that row is hovered.
+                    let group = format!("session-{index}");
                     div()
                         .id(("session", index))
+                        .group(group.clone())
                         .flex()
                         .flex_row()
                         .items_center()
+                        .gap_2()
                         .w_full()
-                        .px_3()
-                        .py_2()
+                        .px(px(8.))
+                        .py(px(6.))
+                        .mb(px(2.))
+                        .rounded(px(6.))
                         .cursor_pointer()
-                        .when(active, |row| row.bg(selected))
-                        .hover(|row| row.bg(close_hover))
+                        .when(active, |row| row.bg(chrome.tab_active))
+                        .hover(|row| row.bg(chrome.tab_hover))
+                        .child(
+                            // A terminal glyph in the terminal font, marking the session as a shell.
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .flex_shrink_0()
+                                .size(px(22.))
+                                .rounded(px(5.))
+                                .bg(if active { chrome.surface } else { chrome.tab_active })
+                                .font_family(self.style.font_family.clone())
+                                .text_size(px(9.))
+                                .text_color(badge_text)
+                                .child(">_"),
+                        )
                         .child(
                             div()
                                 .flex_1()
@@ -1170,40 +1421,83 @@ impl Workspace {
                                         .overflow_hidden()
                                         .whitespace_nowrap()
                                         .text_ellipsis()
-                                        .text_color(if active { text } else { muted })
+                                        .text_size(px(12.))
+                                        .text_color(text)
                                         .child(title),
                                 )
                                 .child(
                                     div()
-                                        .text_xs()
-                                        .text_color(muted)
+                                        .flex()
+                                        .flex_row()
+                                        .min_w_0()
                                         .overflow_hidden()
                                         .whitespace_nowrap()
-                                        .text_ellipsis()
-                                        .child(detail),
+                                        .text_size(px(10.5))
+                                        .text_color(muted)
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .overflow_hidden()
+                                                .text_ellipsis()
+                                                .child(dir),
+                                        )
+                                        .when_some(branch, |line, branch| {
+                                            line.child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .text_color(chrome.success)
+                                                    .child(format!(" · {branch}")),
+                                            )
+                                        })
+                                        .when(running, |line| {
+                                            line.child(div().flex_shrink_0().child(" · running"))
+                                        }),
                                 ),
                         )
                         .child(
+                            // The shortcut for tabs 1 to 9. On hover the close button takes its place.
                             div()
-                                .id(("session-close", index))
+                                .relative()
                                 .flex()
                                 .items_center()
                                 .justify_center()
                                 .flex_shrink_0()
-                                .ml_1()
-                                .size(px(18.))
-                                .rounded_sm()
-                                .text_color(muted)
-                                .cursor_pointer()
-                                .hover(|button| button.bg(divider).text_color(text))
-                                .child("×")
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |ws, _: &MouseDownEvent, window, cx| {
-                                        // The click must not reach the row, or it would select the tab first.
-                                        cx.stop_propagation();
-                                        ws.close_tab(index, window, cx);
-                                    }),
+                                .size(px(16.))
+                                .when(index < 9, |slot| {
+                                    slot.child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .text_color(muted)
+                                            .opacity(0.7)
+                                            .group_hover(group.clone(), |hint| hint.invisible())
+                                            .child(format!("⌘{}", index + 1)),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .id(("session-close", index))
+                                        .absolute()
+                                        .top_0()
+                                        .left_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .size(px(16.))
+                                        .rounded(px(4.))
+                                        .cursor_pointer()
+                                        .text_color(muted)
+                                        .invisible()
+                                        .group_hover(group, |button| button.visible())
+                                        .hover(|button| button.bg(close_hover).text_color(text))
+                                        .child("×")
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |ws, _: &MouseDownEvent, window, cx| {
+                                                // The click must not reach the row, or it would select the tab first.
+                                                cx.stop_propagation();
+                                                ws.close_tab(index, window, cx);
+                                            }),
+                                        ),
                                 ),
                         )
                         .on_mouse_down(
@@ -1235,16 +1529,20 @@ impl Workspace {
                         .flex_row()
                         .items_center()
                         .w_full()
-                        .pl(px(12.0 + 14.0 * row.depth as f32))
+                        .h(px(24.))
+                        .pl(px(8.0 + 14.0 * row.depth as f32))
                         .pr_2()
-                        .py_px()
+                        .rounded(px(4.))
+                        .text_size(px(13.))
                         .cursor_pointer()
-                        .hover(|line| line.bg(close_hover))
+                        .hover(|line| line.bg(chrome.tab_hover))
                         .child(
                             div()
                                 .w(px(12.))
                                 .flex_shrink_0()
+                                .text_size(px(9.))
                                 .text_color(muted)
+                                .opacity(0.7)
                                 .child(marker),
                         )
                         .child(
@@ -1252,6 +1550,7 @@ impl Workspace {
                                 .overflow_hidden()
                                 .whitespace_nowrap()
                                 .text_ellipsis()
+                                .text_color(if is_dir { text } else { muted })
                                 .child(row.name.clone()),
                         )
                         .on_mouse_down(
@@ -1269,22 +1568,16 @@ impl Workspace {
                 })
                 .collect(),
         };
+        // The root of the file tree, above its rows.
+        let root_label = match mode {
+            Mode::Files => self.sidebar.tree.root().map(display_dir),
+            Mode::Sessions => None,
+        };
         let empty_note = match (mode, self.sidebar.tree.root()) {
             (Mode::Files, None) => Some("No folder for this pane"),
             _ => None,
         };
 
-        let strip = div()
-            .flex()
-            .flex_col()
-            .flex_shrink_0()
-            .w(px(ACTIVITY_WIDTH))
-            .h_full()
-            .py_1()
-            .border_r_1()
-            .border_color(divider)
-            .child(self.sidebar_switch("▤", Mode::Sessions, mode, cx))
-            .child(self.sidebar_switch("▦", Mode::Files, mode, cx));
         let panel = div()
             .flex()
             .flex_col()
@@ -1300,27 +1593,87 @@ impl Workspace {
                     .min_h_0()
                     .overflow_y_scroll()
                     .py_1()
+                    .when_some(root_label, |body, label| {
+                        body.child(
+                            div()
+                                .px(px(8.))
+                                .pb(px(6.))
+                                .text_size(px(11.))
+                                .text_color(muted)
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(label),
+                        )
+                    })
                     .children(body)
                     .when_some(empty_note, |body, note| {
-                        body.child(div().px_3().py_2().text_color(muted).child(note))
+                        body.child(
+                            div()
+                                .px(px(8.))
+                                .py_2()
+                                .text_size(px(12.))
+                                .text_color(muted)
+                                .child(note),
+                        )
                     }),
             );
 
+        // The hairline is the visible part. The wider transparent strip centred
+        // on it is what takes the mouse, as with the split dividers. Over the
+        // edge it shows an accent line on hover and while dragging.
+        let accent = chrome.accent.opacity(0.6);
+        let dragging = self.sidebar_drag;
+        let handle = div()
+            .group("sidebar-resize")
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right(px(SIDEBAR_GRAB / 2.0 - 0.5))
+            .w(px(SIDEBAR_GRAB))
+            .cursor_ew_resize()
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px((SIDEBAR_GRAB - 2.0) / 2.0))
+                    .w(px(2.))
+                    .when(dragging, |d| d.bg(accent))
+                    .group_hover("sidebar-resize", |s| s.bg(accent)),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|ws, event: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    // A double click puts the width back and does not start a drag.
+                    if event.click_count >= 2 {
+                        ws.sidebar.width = SIDEBAR_WIDTH;
+                    } else {
+                        ws.sidebar_drag = true;
+                    }
+                    cx.notify();
+                }),
+            );
         div()
+            .relative()
             .flex()
-            .flex_row()
+            .flex_col()
             .flex_shrink_0()
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(self.sidebar.width))
             .h_full()
             .min_h_0()
+            .px(px(6.))
+            .pt(px(8.))
             .bg(chrome.tab_bar)
-            .child(strip)
+            .border_r_1()
+            .border_color(divider)
             .child(panel)
+            .child(handle)
     }
 
-    /// One button of the strip on the sidebar's left edge. The active one has a
-    /// bar on its left and a highlight.
-    fn sidebar_switch(
+    /// One segment of the sidebar's switch. The active one is raised.
+    fn sidebar_segment(
         &self,
         label: &'static str,
         target: Mode,
@@ -1332,15 +1685,18 @@ impl Workspace {
         div()
             .id(label)
             .flex()
+            .flex_1()
             .items_center()
             .justify_center()
-            .w_full()
-            .h(px(36.))
-            .border_l_2()
-            .border_color(if active { chrome.accent } else { chrome.tab_bar })
+            .py(px(3.))
+            .rounded(px(4.))
+            .text_size(px(11.))
             .cursor_pointer()
             .text_color(if active { chrome.text } else { chrome.muted })
-            .when(active, |tab| tab.bg(chrome.selected))
+            .when(active, |segment| segment.bg(chrome.tab_active))
+            .when(!active, |segment| {
+                segment.hover(|segment| segment.text_color(chrome.text))
+            })
             .child(label)
             .on_mouse_down(
                 MouseButton::Left,
@@ -1501,9 +1857,13 @@ impl Render for Workspace {
             .bg(palette.background)
             .text_color(palette.chrome.text)
             .on_mouse_move(cx.listener(Self::drag_divider))
+            .on_mouse_move(cx.listener(Self::drag_sidebar))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|ws, _: &MouseUpEvent, _, _| ws.divider_drag = None),
+                cx.listener(|ws, _: &MouseUpEvent, _, _| {
+                    ws.divider_drag = None;
+                    ws.sidebar_drag = false;
+                }),
             )
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::show_sessions))
@@ -1526,18 +1886,20 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::zoom_reset))
-            .when(self.tabs.len() > 1 && !self.sidebar.open, |root| {
-                root.child(self.render_tab_bar(cx))
-            })
+            // The tab bar is the window's title bar, so it is always there.
+            .child(self.render_tab_bar(cx))
             .child(body);
         if let Some(error) = &self.error {
             root = root.child(
                 div()
                     .flex_shrink_0()
-                    .px_3()
+                    .px_4()
                     .py_2()
-                    .bg(palette.chrome.error)
-                    .text_color(palette.opaque_background)
+                    .text_size(px(13.))
+                    .bg(palette.chrome.error.opacity(0.12))
+                    .border_t_1()
+                    .border_color(palette.chrome.error)
+                    .text_color(palette.chrome.error)
                     .child(error.clone()),
             );
         }
@@ -1593,6 +1955,35 @@ fn shortcut_text(window: &Window, action: &dyn Action) -> String {
     } else {
         pretty_keys(&window.keystroke_text_for(action))
     }
+}
+
+/// The shortcut as key chips, one per stroke: `⇧⌘P` is one chip, `⌘K ⌘T` two.
+fn key_chips(shortcut: &str, chrome: &Chrome) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .gap_1()
+        .children(
+            shortcut
+                .split(' ')
+                .filter(|stroke| !stroke.is_empty())
+                .map(|stroke| {
+                    div()
+                        .px_1p5()
+                        .rounded(px(4.))
+                        .border_1()
+                        .border_color(chrome.divider)
+                        .bg(chrome.surface)
+                        .text_size(px(11.))
+                        .text_color(chrome.muted)
+                        .child(stroke.to_string())
+                }),
+        )
+}
+
+/// The caret of the palette query: a 1px accent bar.
+fn caret(chrome: &Chrome) -> impl IntoElement {
+    div().w(px(1.)).h(px(16.)).bg(chrome.accent)
 }
 
 /// The saved form of a split tree. The directory is read from each pane's shell.
