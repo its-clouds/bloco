@@ -25,14 +25,52 @@ __term_session_report_cwd() {
   printf '\033]7;file://%s%s%s\007' "$HOSTNAME" "$dir" "$__term_session_nonce"
 }
 
+# The user's prompt commands. Since bash 5.1 PROMPT_COMMAND can be an array,
+# and tools add hooks with `PROMPT_COMMAND+=(hook)` (systemd's
+# /etc/profile.d/80-systemd-osc-context.sh, direnv, starship). Bash runs each
+# element as a command of its own, which the DEBUG trap would report as the
+# user's command. So every element moves here and runs inside
+# __term_session_precmd, where the DEBUG trap does not fire.
+declare -p __term_session_user_prompt_commands &>/dev/null || __term_session_user_prompt_commands=()
+# Set when hooks were taken over at this prompt (see __term_session_preexec).
+__term_session_adopted=
+
+# Moves every element of PROMPT_COMMAND except ours to the list above, and
+# leaves PROMPT_COMMAND holding only __term_session_precmd.
+__term_session_adopt_prompt_commands() {
+  local cmd
+  for cmd in "${PROMPT_COMMAND[@]}"; do
+    if [[ -n $cmd && $cmd != __term_session_precmd ]]; then
+      __term_session_user_prompt_commands+=("$cmd")
+    fi
+  done
+  unset PROMPT_COMMAND
+  PROMPT_COMMAND=__term_session_precmd
+}
+
+# Sets $? for the next command.
+__term_session_status() {
+  return "$1"
+}
+
 __term_session_precmd() {
   local exit_status=$?
   printf '\033]133;D;%d%s\007' "$exit_status" "$__term_session_nonce"
   __term_session_running=
   __term_session_report_cwd
-  # The user's own prompt command runs here, so that bash does not run it as
-  # a command of its own (which the DEBUG trap would report).
-  eval "$__term_session_user_prompt_command"
+  # A hook added since the last prompt is taken over for the next prompts.
+  # Bash has already copied the array for this prompt, so it still runs once
+  # after us; __term_session_preexec skips it.
+  if (( ${#PROMPT_COMMAND[@]} > 1 )); then
+    __term_session_adopt_prompt_commands
+    __term_session_adopted=1
+  fi
+  # The user's prompt commands see the exit status of the user's command.
+  local cmd
+  for cmd in "${__term_session_user_prompt_commands[@]}"; do
+    __term_session_status "$exit_status"
+    eval "$cmd"
+  done
   printf '\033]133;A%s\007' "$__term_session_nonce"
   return "$exit_status"
 }
@@ -43,6 +81,14 @@ __term_session_preexec() {
   if [[ $BASH_COMMAND == __term_session_* || -n $__term_session_running ]]; then
     return 0
   fi
+  # A hook taken over at this prompt runs once more as a command of its own.
+  if [[ -n $__term_session_adopted ]]; then
+    local hook
+    for hook in "${__term_session_user_prompt_commands[@]}"; do
+      [[ $BASH_COMMAND == "$hook" ]] && return 0
+    done
+  fi
+  __term_session_adopted=
   __term_session_running=1
   # The whole line as typed. BASH_COMMAND is only the first simple command, so
   # it is the fallback. The history entry counts only if it holds that command:
@@ -61,9 +107,6 @@ __term_session_preexec() {
   return 0
 }
 
-if [[ $PROMPT_COMMAND != __term_session_precmd ]]; then
-  __term_session_user_prompt_command=$PROMPT_COMMAND
-  PROMPT_COMMAND=__term_session_precmd
-fi
+__term_session_adopt_prompt_commands
 PS1+='\[\e]133;B'"$__term_session_nonce"'\a\]'
 trap '__term_session_preexec' DEBUG

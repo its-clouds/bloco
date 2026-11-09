@@ -409,6 +409,34 @@ mod tests {
     }
 
     /// Waits until `count` blocks have finished.
+    /// Since bash 5.1 tools add prompt hooks with `PROMPT_COMMAND+=(hook)`, as
+    /// systemd's /etc/profile.d script does. Bash runs each element as a
+    /// command, which the DEBUG trap must not report as the user's command.
+    /// The hook still runs at every prompt.
+    #[test]
+    fn bash_runs_prompt_command_hooks_without_reporting_them() {
+        let Some(shell) = find_shell("bash") else {
+            eprintln!("skipping: bash is not installed");
+            return;
+        };
+        let session = Session::spawn_shell(&shell, 100, 24, None, |_| {}).unwrap();
+        let add_hook = "hook() { hook_runs=$((hook_runs + 1)); }; PROMPT_COMMAND+=(hook)";
+        let count = "echo runs:$hook_runs";
+        for command in [add_hook, "true", count] {
+            session.write(format!("{command}\r").as_bytes()).unwrap();
+        }
+        wait_for_finished(&session, 3);
+        let blocks = session.blocks();
+        let commands: Vec<_> = blocks.iter().filter_map(|b| b.command.as_deref()).collect();
+        assert_eq!(commands, [add_hook, "true", count]);
+        let output = session.block_output(blocks[2].id).unwrap_or_default();
+        let runs: u32 = output
+            .strip_prefix("runs:")
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("unexpected output {output:?}"));
+        assert!(runs >= 2, "the hook ran {runs} times");
+    }
+
     fn wait_for_finished(session: &Session, count: usize) {
         let deadline = Instant::now() + Duration::from_secs(30);
         while session
@@ -496,8 +524,19 @@ mod tests {
         assert_blocks_intact(&session, 24, &expected);
 
         // Not narrower than the prompt: readline redraws a prompt that wraps when
-        // the width changes, and that redraw overwrites the rows above it.
-        for (cols, rows) in [(40, 24), (120, 24), (120, 12), (40, 10), (80, 24)] {
+        // the width changes, and that redraw overwrites the rows above it. The
+        // prompt is the machine's own (a CI host name can be 60 characters), so
+        // the narrow width follows it.
+        let prompt_width = session
+            .snapshot()
+            .text_lines()
+            .iter()
+            .rev()
+            .map(|line| line.trim_end().chars().count())
+            .find(|&width| width > 0)
+            .unwrap_or(0);
+        let narrow = (prompt_width as u16 + 10).max(40);
+        for (cols, rows) in [(narrow, 24), (120, 24), (120, 12), (narrow, 10), (80, 24)] {
             session.resize(cols, rows).unwrap();
             // The shell redraws its prompt when it gets the new size.
             std::thread::sleep(Duration::from_millis(200));
