@@ -8,8 +8,10 @@ sync, telemetry, or AI that acts on its own.**
 *Bloco* is Portuguese for "block". It's also the name of Brazil's Carnival
 street parades.
 
-> Status: early. M2 of the [roadmap](docs/roadmap.md) is built: a GPUI window with
-> tabs, splits, a command palette, and config with hot reload. Blocks (M3) are next.
+> Status: early, pre-1.0, macOS only. M1–M6 of the [roadmap](docs/roadmap.md)
+> are built: tabs and splits, a command palette, command blocks, a Warp-style
+> input editor with completions, sidebars, a settings panel and themes. There
+> are no releases yet; build from source.
 > Code: [github.com/its-clouds/bloco](https://github.com/its-clouds/bloco).
 
 ## Build and run
@@ -44,7 +46,13 @@ cargo run -p app --release          # run from source
 | [docs/open-questions.md](docs/open-questions.md) | Decisions still pending, with the spike that should settle each |
 | [docs/spikes/0001-ui-toolkit.md](docs/spikes/0001-ui-toolkit.md) | GPUI vs custom `wgpu` spike plan (deferred after Phase 0; kept for later) |
 
+## Security
+
+Found a vulnerability? Please report it privately, not in a public issue. See
+[SECURITY.md](SECURITY.md).
+
 ## License
 
-GPL-3.0 (see [docs/open-questions.md](docs/open-questions.md) for the pending
-question about licensing the plugin SDK).
+GPL-3.0-only, see [LICENSE](LICENSE). Code adapted from Zed is listed in
+[NOTICE](NOTICE). Licensing of the future plugin SDK is still open, see
+[docs/open-questions.md](docs/open-questions.md).
