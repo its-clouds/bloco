@@ -1915,21 +1915,25 @@ impl Workspace {
     }
 
     fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.tabs.is_empty() {
-            let next = (self.active_tab + 1) % self.tabs.len();
+        // Follow the order the sidebar shows, not the order of `self.tabs`.
+        if let Some(next) = tab_groups::step_in_display_order(&self.tabs, &self.groups, self.active_tab, 1) {
             self.select_tab(next, window, cx);
         }
     }
 
     fn previous_tab(&mut self, _: &PreviousTab, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.tabs.is_empty() {
-            let previous = (self.active_tab + self.tabs.len() - 1) % self.tabs.len();
+        if let Some(previous) =
+            tab_groups::step_in_display_order(&self.tabs, &self.groups, self.active_tab, -1)
+        {
             self.select_tab(previous, window, cx);
         }
     }
 
+    /// Cmd+N picks the Nth session as the sidebar shows it, not the Nth in `self.tabs`.
     fn select_tab_action(&mut self, action: &SelectTab, window: &mut Window, cx: &mut Context<Self>) {
-        self.select_tab(action.0, window, cx);
+        if let Some(&index) = tab_groups::display_order(&self.tabs, &self.groups).get(action.0) {
+            self.select_tab(index, window, cx);
+        }
     }
 
     fn split_right(&mut self, _: &SplitRight, window: &mut Window, cx: &mut Context<Self>) {
@@ -2413,6 +2417,7 @@ impl Workspace {
 
     /// The Sessions list in sections. Tabs in no group come first, in tab order.
     /// Then each group, with its header and its tabs. Empty groups show their header.
+    /// Keep in step with `tab_groups::display_order`, which next/previous session and Cmd+1…9 follow.
     fn sidebar_sessions(
         &self,
         rows: Vec<(Option<GroupId>, AnyElement)>,

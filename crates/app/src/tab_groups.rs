@@ -112,6 +112,36 @@ pub fn clean_name(text: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
+/// The tab indices in the order the sidebar shows them: tabs in no group
+/// first, then each group's tabs in `groups` order, then tabs whose group is
+/// unknown. Keep in step with `Workspace::sidebar_sessions`.
+pub fn display_order<T: Grouped>(items: &[T], groups: &[Group]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..items.len()).filter(|&i| items[i].group().is_none()).collect();
+    for group in groups {
+        order.extend((0..items.len()).filter(|&i| items[i].group() == Some(group.id)));
+    }
+    let unknown: Vec<usize> = (0..items.len()).filter(|i| !order.contains(i)).collect();
+    order.extend(unknown);
+    order
+}
+
+/// The index of the tab `step` places from `active` in `display_order`,
+/// wrapping around. `None` when there are no tabs.
+pub fn step_in_display_order<T: Grouped>(
+    items: &[T],
+    groups: &[Group],
+    active: usize,
+    step: isize,
+) -> Option<usize> {
+    let order = display_order(items, groups);
+    if order.is_empty() {
+        return None;
+    }
+    let len = order.len() as isize;
+    let at = order.iter().position(|&i| i == active).unwrap_or(0) as isize;
+    Some(order[(at + step).rem_euclid(len) as usize])
+}
+
 /// Clears the group of every item in `group`. Their order does not change.
 pub fn remove_group<T: Grouped>(items: &mut [T], group: GroupId) {
     for item in items.iter_mut().filter(|item| item.group() == Some(group)) {
@@ -375,6 +405,27 @@ mod tests {
         assert_eq!(names(&items), ["g1", "g2", "a"]);
         assert_eq!(items[1].group, None);
         assert_contiguous(&items);
+    }
+
+    #[test]
+    fn display_order_puts_ungrouped_tabs_first_then_groups_in_order() {
+        let groups = [Group { id: 2, name: "b".into() }, Group { id: 1, name: "a".into() }];
+        let items = [item("a1", Some(1)), item("b1", Some(2)), item("x", None), item("a2", Some(1))];
+        assert_eq!(display_order(&items, &groups), vec![2, 1, 0, 3]);
+    }
+
+    #[test]
+    fn stepping_follows_the_sidebar_order_and_wraps() {
+        let groups = [Group { id: 1, name: "a".into() }];
+        // Tab list: a1, a2, x. Sidebar: x, a1, a2.
+        let items = [item("a1", Some(1)), item("a2", Some(1)), item("x", None)];
+        assert_eq!(step_in_display_order(&items, &groups, 2, 1), Some(0));
+        assert_eq!(step_in_display_order(&items, &groups, 0, 1), Some(1));
+        assert_eq!(step_in_display_order(&items, &groups, 1, 1), Some(2));
+        assert_eq!(step_in_display_order(&items, &groups, 2, -1), Some(1));
+        assert_eq!(step_in_display_order(&items, &groups, 0, -1), Some(2));
+        let empty: [Item; 0] = [];
+        assert_eq!(step_in_display_order(&empty, &groups, 0, 1), None);
     }
 
     #[test]

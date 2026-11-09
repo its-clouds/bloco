@@ -60,7 +60,8 @@ actions!(
     ]
 );
 
-/// Switches to tab `0`-based index. The keymap uses 1-based ids (`tab.select.1`).
+/// Switches to the session at this `0`-based position in the sidebar order
+/// (`tab_groups::display_order`). The keymap uses 1-based ids (`tab.select.1`).
 #[derive(Clone, PartialEq, Action)]
 #[action(namespace = bloco, no_json)]
 pub struct SelectTab(pub usize);
