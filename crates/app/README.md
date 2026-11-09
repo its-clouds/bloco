@@ -14,6 +14,7 @@ dependency.
 | `commands.rs` | The action registry: ids, titles, default keys, and the GPUI keybindings built from them |
 | `palette.rs` | Command palette state, fuzzy filter, shortcut text (unit tests) |
 | `terminal_view.rs` | One pane: keyboard, mouse, clipboard, scrollback, IME, Option as Meta, and its find bar. Emits `TerminalEvent`s to the workspace |
+| `clipboard_paste.rs` | What Cmd+V types: text as is, copied files as quoted paths, an image saved to `$TMPDIR/bloco-paste/` and pasted as its path (unit tests) |
 | `find.rs` | Find bar state: query, toggles, matches, current match, counter, highlighted cells (unit tests) |
 | `file_links.rs` | Resolves a path printed in the terminal (`~`, relative to the block's directory) and reveals it in Finder (unit tests) |
 | `preview.rs` | What the file preview shows: the file read from disk, Markdown parsed into blocks, size and binary checks (unit tests) |
@@ -45,7 +46,7 @@ These are the defaults. `keymap.toml` can change any of them (see below).
 | Move the active pane to a new session, or into another session beside its active pane | none, palette only | `pane.move_to_new_tab`, `pane.move_to_tab` |
 | Split right / split down | Cmd+D / Cmd+Shift+D | `pane.split_right`, `pane.split_down` |
 | Focus the pane left, right, above, below | Cmd+Opt+arrows | `pane.focus_left`, ... |
-| Copy / paste | Cmd+C / Cmd+V | `edit.copy`, `edit.paste` |
+| Copy / paste (an image pastes as a temp file path) | Cmd+C / Cmd+V | `edit.copy`, `edit.paste` |
 | Move back / forward one word (command line) | Option+← / Option+→ | `terminal.word_back`, `terminal.word_forward` |
 | Move to start / end of line (command line) | Cmd+← / Cmd+→ | `terminal.line_start`, `terminal.line_end` |
 | Delete word backward / delete to start of line | Option+Backspace / Cmd+Backspace | `terminal.delete_word_back`, `terminal.delete_to_line_start` |
@@ -80,6 +81,9 @@ key sends nothing: it does not reach the shell.
 New tabs and splits start in the active pane's directory. The directory comes from
 OSC 7, which the zsh integration sends before each prompt. Without OSC 7 the app asks
 the OS for the shell's directory by its process id (macOS only).
+
+A new session opened while the active session is in a group joins that group, right
+after the active session.
 
 ## Find
 

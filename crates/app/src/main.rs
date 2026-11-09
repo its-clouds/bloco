@@ -2,6 +2,7 @@
 //! `docs/roadmap.md`.
 
 mod block_header;
+mod clipboard_paste;
 mod colors;
 mod commands;
 mod completion;

@@ -27,6 +27,7 @@ use term_session::{
 };
 
 use crate::block_header::{display_dir, shorten};
+use crate::clipboard_paste;
 use crate::colors::Palette;
 use crate::commands::{
     BlockCopyCommand, BlockCopyOutput, BlockNext, BlockPrevious, BlockToggleCollapse,
@@ -524,7 +525,10 @@ impl TerminalView {
     }
 
     fn paste(&mut self, _: &PasteClipboard, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+        let Some(text) = cx
+            .read_from_clipboard()
+            .and_then(|item| clipboard_paste::paste_text(&item))
+        else {
             return;
         };
         if self.owns_input() {

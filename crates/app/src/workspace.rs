@@ -1950,14 +1950,24 @@ impl Workspace {
         let cwd = self.active_cwd(cx);
         match self.add_pane(cwd.as_deref(), window, cx) {
             Ok(pane) => {
-                self.tabs.push(Tab {
-                    panes: SplitTree::new(pane.clone()),
-                    active: pane,
-                    name: None,
-                    group: None,
-                    preview: None,
-                });
-                self.active_tab = self.tabs.len() - 1;
+                // A session opened from inside a group joins that group, right
+                // after the active tab, so the group's run stays contiguous.
+                let group = self.active_group();
+                let index = match group {
+                    Some(_) => self.active_tab + 1,
+                    None => self.tabs.len(),
+                };
+                self.tabs.insert(
+                    index,
+                    Tab {
+                        panes: SplitTree::new(pane.clone()),
+                        active: pane,
+                        name: None,
+                        group,
+                        preview: None,
+                    },
+                );
+                self.active_tab = index;
                 self.focus_active(window, cx);
             }
             Err(e) => self.set_error(Some(e), cx),
