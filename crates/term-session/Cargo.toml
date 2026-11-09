@@ -11,5 +11,6 @@ alacritty_terminal = "0.25"
 anyhow = "1"
 portable-pty = "0.9"
 regex = "1"
+tempfile = "3"
 
 [dev-dependencies]

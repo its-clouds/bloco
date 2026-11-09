@@ -1,1 +1,15 @@
 /target
+
+# macOS
+.DS_Store
+
+# Screen recordings and captures kept next to the code while testing
+*.mov
+*.mp4
+*.gif
+
+# Local tool state
+.claude/
+.idea/
+.vscode/
+*.swp

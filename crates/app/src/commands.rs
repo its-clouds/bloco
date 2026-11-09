@@ -12,6 +12,16 @@ actions!(
         NewTab,
         CloseTab,
         ClosePane,
+        RenameTab,
+        RenamePane,
+        MoveTabLeft,
+        MoveTabRight,
+        MoveTabToGroup,
+        MovePaneToNewTab,
+        MovePaneToTab,
+        NewGroup,
+        RenameGroup,
+        DeleteGroup,
         NextTab,
         PreviousTab,
         SplitRight,
@@ -45,6 +55,7 @@ actions!(
         ShowFiles,
         OpenSettings,
         ImportTheme,
+        ClosePreview,
         QuitApp,
     ]
 );
@@ -62,19 +73,29 @@ pub struct Command {
 
 pub const COMMANDS: &[Command] = &[
     Command { id: "palette.toggle", title: "Show command palette", keys: &["cmd-shift-p", "cmd-p"] },
-    Command { id: "tab.new", title: "New tab", keys: &["cmd-t"] },
-    Command { id: "tab.close", title: "Close tab", keys: &[] },
-    Command { id: "tab.next", title: "Next tab", keys: &["cmd-}"] },
-    Command { id: "tab.previous", title: "Previous tab", keys: &["cmd-{"] },
-    Command { id: "tab.select.1", title: "Go to tab 1", keys: &["cmd-1"] },
-    Command { id: "tab.select.2", title: "Go to tab 2", keys: &["cmd-2"] },
-    Command { id: "tab.select.3", title: "Go to tab 3", keys: &["cmd-3"] },
-    Command { id: "tab.select.4", title: "Go to tab 4", keys: &["cmd-4"] },
-    Command { id: "tab.select.5", title: "Go to tab 5", keys: &["cmd-5"] },
-    Command { id: "tab.select.6", title: "Go to tab 6", keys: &["cmd-6"] },
-    Command { id: "tab.select.7", title: "Go to tab 7", keys: &["cmd-7"] },
-    Command { id: "tab.select.8", title: "Go to tab 8", keys: &["cmd-8"] },
-    Command { id: "tab.select.9", title: "Go to tab 9", keys: &["cmd-9"] },
+    Command { id: "tab.new", title: "New session", keys: &["cmd-t"] },
+    Command { id: "tab.close", title: "Close session", keys: &[] },
+    Command { id: "tab.rename", title: "Rename session", keys: &[] },
+    Command { id: "pane.rename", title: "Rename pane", keys: &[] },
+    Command { id: "tab.move_left", title: "Move session up", keys: &["cmd-ctrl-left"] },
+    Command { id: "tab.move_right", title: "Move session down", keys: &["cmd-ctrl-right"] },
+    Command { id: "tab.move_to_group", title: "Move session to group...", keys: &[] },
+    Command { id: "pane.move_to_new_tab", title: "Move pane to new session", keys: &[] },
+    Command { id: "pane.move_to_tab", title: "Move pane to session...", keys: &[] },
+    Command { id: "group.new", title: "New group", keys: &[] },
+    Command { id: "group.rename", title: "Rename group", keys: &[] },
+    Command { id: "group.delete", title: "Delete group", keys: &[] },
+    Command { id: "tab.next", title: "Next session", keys: &["cmd-}"] },
+    Command { id: "tab.previous", title: "Previous session", keys: &["cmd-{"] },
+    Command { id: "tab.select.1", title: "Go to session 1", keys: &["cmd-1"] },
+    Command { id: "tab.select.2", title: "Go to session 2", keys: &["cmd-2"] },
+    Command { id: "tab.select.3", title: "Go to session 3", keys: &["cmd-3"] },
+    Command { id: "tab.select.4", title: "Go to session 4", keys: &["cmd-4"] },
+    Command { id: "tab.select.5", title: "Go to session 5", keys: &["cmd-5"] },
+    Command { id: "tab.select.6", title: "Go to session 6", keys: &["cmd-6"] },
+    Command { id: "tab.select.7", title: "Go to session 7", keys: &["cmd-7"] },
+    Command { id: "tab.select.8", title: "Go to session 8", keys: &["cmd-8"] },
+    Command { id: "tab.select.9", title: "Go to session 9", keys: &["cmd-9"] },
     Command { id: "pane.close", title: "Close pane", keys: &["cmd-w"] },
     Command { id: "pane.split_right", title: "Split right", keys: &["cmd-d"] },
     Command { id: "pane.split_down", title: "Split down", keys: &["cmd-shift-d"] },
@@ -107,6 +128,7 @@ pub const COMMANDS: &[Command] = &[
     Command { id: "sidebar.files", title: "Show file tree in sidebar", keys: &["cmd-shift-e"] },
     Command { id: "settings.open", title: "Open settings", keys: &["cmd-,"] },
     Command { id: "theme.import", title: "Import theme from file", keys: &[] },
+    Command { id: "preview.close", title: "Close File Preview", keys: &[] },
     Command { id: "app.quit", title: "Quit Bloco", keys: &["cmd-q"] },
 ];
 
@@ -116,6 +138,16 @@ pub fn action_for(id: &str) -> Option<Box<dyn Action>> {
         "palette.toggle" => Box::new(TogglePalette),
         "tab.new" => Box::new(NewTab),
         "tab.close" => Box::new(CloseTab),
+        "tab.rename" => Box::new(RenameTab),
+        "pane.rename" => Box::new(RenamePane),
+        "tab.move_left" => Box::new(MoveTabLeft),
+        "tab.move_right" => Box::new(MoveTabRight),
+        "tab.move_to_group" => Box::new(MoveTabToGroup),
+        "pane.move_to_new_tab" => Box::new(MovePaneToNewTab),
+        "pane.move_to_tab" => Box::new(MovePaneToTab),
+        "group.new" => Box::new(NewGroup),
+        "group.rename" => Box::new(RenameGroup),
+        "group.delete" => Box::new(DeleteGroup),
         "tab.next" => Box::new(NextTab),
         "tab.previous" => Box::new(PreviousTab),
         "pane.close" => Box::new(ClosePane),
@@ -150,6 +182,7 @@ pub fn action_for(id: &str) -> Option<Box<dyn Action>> {
         "sidebar.files" => Box::new(ShowFiles),
         "settings.open" => Box::new(OpenSettings),
         "theme.import" => Box::new(ImportTheme),
+        "preview.close" => Box::new(ClosePreview),
         "app.quit" => Box::new(QuitApp),
         _ => {
             let number: usize = id.strip_prefix("tab.select.")?.parse().ok()?;
@@ -207,6 +240,15 @@ mod tests {
         assert!(action_for("tab.select.0").is_none());
         assert!(action_for("tab.select.10").is_none());
         assert!(action_for("nope").is_none());
+    }
+
+    #[test]
+    fn no_two_default_bindings_share_keys() {
+        let mut seen = std::collections::HashSet::new();
+        for binding in default_keymap() {
+            let keys = config::keymap::normalize(&binding.keys);
+            assert!(seen.insert(keys.clone()), "{keys} is bound twice");
+        }
     }
 
     #[test]

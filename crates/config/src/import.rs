@@ -2,6 +2,8 @@
 //! (an XML property list) and base16 schemes (YAML, one `baseNN: "rrggbb"` per
 //! line). Both give a [`Scheme`]; [`Scheme::into_theme`] derives the rest.
 
+use std::cell::Cell;
+
 use crate::theme::{Rgb, Scheme, mix};
 
 /// The extensions of theme files, without the dot.
@@ -137,9 +139,22 @@ pub fn parse_base16(text: &str) -> Result<Scheme, String> {
     })
 }
 
+/// How deep containers may nest in a binary property list. A preset nests
+/// two levels. The limit stops a dict that holds itself.
+const MAX_DEPTH: usize = 64;
+
+/// How much work reading a binary property list may do. Each object costs
+/// [`OBJECT_COST`] plus its bytes. Objects can be shared, so a small file can
+/// refer to the same dict many times over; this caps the tree it builds.
+const MAX_WORK: usize = 64 * 1024 * 1024;
+const OBJECT_COST: usize = 64;
+
 /// Reads a binary property list (`bplist00`) into the same element shape the XML
 /// reader gives: `dict` holds `key` and value elements in order, and `real`,
 /// `integer` and `string` hold their text. Other types are read as empty elements.
+///
+/// The file is not trusted: sizes and offsets are checked, and a bad one is an
+/// error, never a panic.
 fn parse_binary(data: &[u8]) -> Result<Element, String> {
     if data.len() < 40 {
         return Err("binary property list is too short".into());
@@ -147,24 +162,30 @@ fn parse_binary(data: &[u8]) -> Result<Element, String> {
     let trailer = &data[data.len() - 32..];
     let offset_size = usize::from(trailer[6]);
     let ref_size = usize::from(trailer[7]);
-    let count = read_be(&trailer[8..16]) as usize;
-    let top = read_be(&trailer[16..24]) as usize;
-    let table = read_be(&trailer[24..32]) as usize;
+    let count = read_be(&trailer[8..16]);
+    let top = read_be(&trailer[16..24]);
+    let table = read_be(&trailer[24..32]);
     if !(1..=8).contains(&offset_size) || !(1..=8).contains(&ref_size) {
         return Err("bad binary property list trailer".into());
     }
+    // Each object takes at least one byte, so a larger count is a lie.
+    if count > data.len() as u64 {
+        return Err("bad object count in binary property list".into());
+    }
+    let (count, top, table) = (count as usize, top as usize, usize::try_from(table).unwrap_or(usize::MAX));
     let reader = Binary {
         data,
         offsets: Vec::new(),
         ref_size,
+        work: Cell::new(0),
     };
     let mut offsets = Vec::with_capacity(count);
     for index in 0..count {
-        let at = table + index * offset_size;
+        let at = add(table, mul(index, offset_size)?)?;
         offsets.push(read_be(reader.bytes(at, offset_size)?) as usize);
     }
     let reader = Binary { offsets, ..reader };
-    let root = reader.object(top)?;
+    let root = reader.object(top, 0)?;
     Ok(Element {
         name: String::new(),
         children: vec![Node::Element(Element {
@@ -177,6 +198,14 @@ fn parse_binary(data: &[u8]) -> Result<Element, String> {
 /// A big-endian unsigned integer of up to 8 bytes.
 fn read_be(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0, |value, &byte| (value << 8) | u64::from(byte))
+}
+
+fn add(a: usize, b: usize) -> Result<usize, String> {
+    a.checked_add(b).ok_or_else(|| "size overflow in binary property list".to_string())
+}
+
+fn mul(a: usize, b: usize) -> Result<usize, String> {
+    a.checked_mul(b).ok_or_else(|| "size overflow in binary property list".to_string())
 }
 
 /// An element with only text, as the XML reader would give it.
@@ -192,12 +221,14 @@ struct Binary<'a> {
     /// Where each object starts in `data`, by object number.
     offsets: Vec<usize>,
     ref_size: usize,
+    /// The work done so far. See [`MAX_WORK`].
+    work: Cell<usize>,
 }
 
 impl Binary<'_> {
     fn bytes(&self, start: usize, len: usize) -> Result<&[u8], String> {
         self.data
-            .get(start..start + len)
+            .get(start..add(start, len)?)
             .ok_or_else(|| "truncated binary property list".to_string())
     }
 
@@ -211,6 +242,16 @@ impl Binary<'_> {
         Ok(read_be(self.bytes(at, self.ref_size)?) as usize)
     }
 
+    /// Counts `len` bytes of work and fails past [`MAX_WORK`].
+    fn spend(&self, len: usize) -> Result<(), String> {
+        let work = add(self.work.get(), add(OBJECT_COST, len)?)?;
+        if work > MAX_WORK {
+            return Err("binary property list is too large".into());
+        }
+        self.work.set(work);
+        Ok(())
+    }
+
     /// The length that follows a marker. The low nibble is the length, unless it
     /// is 0xF, when an integer object holds it. Returns the length and how many
     /// bytes the marker and length take.
@@ -218,15 +259,24 @@ impl Binary<'_> {
         if info != 0xF {
             return Ok((usize::from(info), 1));
         }
-        let marker = self.bytes(at + 1, 1)?[0];
+        let marker = self.bytes(add(at, 1)?, 1)?[0];
         if marker >> 4 != 0x1 {
             return Err("bad length in binary property list".into());
         }
         let size = 1usize << (marker & 0xF);
-        Ok((read_be(self.bytes(at + 2, size)?) as usize, 2 + size))
+        if size > 8 {
+            return Err("bad length in binary property list".into());
+        }
+        let len = read_be(self.bytes(add(at, 2)?, size)?);
+        let len = usize::try_from(len).map_err(|_| "bad length in binary property list".to_string())?;
+        Ok((len, 2 + size))
     }
 
-    fn object(&self, index: usize) -> Result<Element, String> {
+    /// Object number `index`. `depth` is how many containers hold it.
+    fn object(&self, index: usize, depth: usize) -> Result<Element, String> {
+        if depth > MAX_DEPTH {
+            return Err("binary property list nests too deep".into());
+        }
         let at = *self
             .offsets
             .get(index)
@@ -236,24 +286,29 @@ impl Binary<'_> {
         match kind {
             0x1 => {
                 let size = 1usize << info;
-                Ok(leaf("integer", &read_be(self.bytes(at + 1, size)?).to_string()))
+                let raw = self.bytes(add(at, 1)?, size)?;
+                self.spend(size)?;
+                Ok(leaf("integer", &read_be(raw).to_string()))
             }
             0x2 => {
                 let value = match info {
-                    2 => f64::from(f32::from_be_bytes(self.array::<4>(at + 1)?)),
-                    3 => f64::from_be_bytes(self.array::<8>(at + 1)?),
+                    2 => f64::from(f32::from_be_bytes(self.array::<4>(add(at, 1)?)?)),
+                    3 => f64::from_be_bytes(self.array::<8>(add(at, 1)?)?),
                     _ => return Err("unsupported real size in binary property list".into()),
                 };
+                self.spend(8)?;
                 Ok(leaf("real", &value.to_string()))
             }
             0x5 => {
                 let (len, head) = self.length(at, info)?;
-                let raw = self.bytes(at + head, len)?;
+                let raw = self.bytes(add(at, head)?, len)?;
+                self.spend(len)?;
                 Ok(leaf("string", &String::from_utf8_lossy(raw)))
             }
             0x6 => {
                 let (len, head) = self.length(at, info)?;
-                let raw = self.bytes(at + head, len * 2)?;
+                let raw = self.bytes(add(at, head)?, mul(len, 2)?)?;
+                self.spend(raw.len())?;
                 let units: Vec<u16> = raw
                     .chunks_exact(2)
                     .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
@@ -262,10 +317,14 @@ impl Binary<'_> {
             }
             0xA => {
                 let (count, head) = self.length(at, info)?;
+                let refs = add(at, head)?;
+                // The references must all be in the file before any space is reserved.
+                self.bytes(refs, mul(count, self.ref_size)?)?;
+                self.spend(count)?;
                 let mut children = Vec::with_capacity(count);
                 for item in 0..count {
-                    let target = self.reference(at + head + item * self.ref_size)?;
-                    children.push(Node::Element(self.object(target)?));
+                    let target = self.reference(refs + item * self.ref_size)?;
+                    children.push(Node::Element(self.object(target, depth + 1)?));
                 }
                 Ok(Element {
                     name: "array".into(),
@@ -274,12 +333,15 @@ impl Binary<'_> {
             }
             0xD => {
                 let (count, head) = self.length(at, info)?;
-                let keys = at + head;
-                let values = keys + count * self.ref_size;
+                let keys = add(at, head)?;
+                let values = add(keys, mul(count, self.ref_size)?)?;
+                // The keys and values must all be in the file before any space is reserved.
+                self.bytes(values, mul(count, self.ref_size)?)?;
+                self.spend(count)?;
                 let mut children = Vec::with_capacity(count * 2);
                 for entry in 0..count {
-                    let key = self.object(self.reference(keys + entry * self.ref_size)?)?;
-                    let value = self.object(self.reference(values + entry * self.ref_size)?)?;
+                    let key = self.object(self.reference(keys + entry * self.ref_size)?, depth + 1)?;
+                    let value = self.object(self.reference(values + entry * self.ref_size)?, depth + 1)?;
                     children.push(Node::Element(leaf("key", &key.text())));
                     children.push(Node::Element(value));
                 }
@@ -353,6 +415,7 @@ impl Element {
 /// A small XML reader for property lists: elements, text, comments, processing
 /// instructions and DOCTYPE. Attributes are skipped. Entities are not decoded,
 /// which the color values never need.
+/// Elements may nest at most [`MAX_DEPTH`] deep.
 fn parse_xml(text: &str) -> Result<Element, String> {
     let mut stack = vec![Element::default()];
     let mut rest = text;
@@ -386,6 +449,10 @@ fn parse_xml(text: &str) -> Result<Element, String> {
             };
             push_node(&mut stack, Node::Element(element))?;
         } else {
+            // A deep tree would overflow the stack when it is dropped.
+            if stack.len() > MAX_DEPTH {
+                return Err("elements nest too deep".into());
+            }
             stack.push(Element {
                 name: tag_name(tag),
                 children: Vec::new(),
@@ -642,6 +709,159 @@ mod tests {
     fn unreadable_bytes_are_an_error() {
         assert!(parse_itermcolors(b"bplist00 but then nothing".to_vec()).is_err());
         assert!(parse_itermcolors(vec![0xff, 0xfe, 0x00]).is_err());
+    }
+
+    /// A binary property list from raw object bytes, with one-byte references
+    /// and two-byte offsets. Eight padding bytes keep tiny files over the
+    /// minimum size.
+    fn raw_plist(objects: &[Vec<u8>], top: u64) -> Vec<u8> {
+        let mut bytes = b"bplist00".to_vec();
+        bytes.extend_from_slice(&[0; 8]);
+        let mut offsets = Vec::new();
+        for object in objects {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(object);
+        }
+        let table = bytes.len();
+        for offset in offsets {
+            bytes.extend_from_slice(&(offset as u16).to_be_bytes());
+        }
+        let mut trailer = [0u8; 32];
+        trailer[6] = 2;
+        trailer[7] = 1;
+        trailer[8..16].copy_from_slice(&(objects.len() as u64).to_be_bytes());
+        trailer[16..24].copy_from_slice(&top.to_be_bytes());
+        trailer[24..32].copy_from_slice(&(table as u64).to_be_bytes());
+        bytes.extend_from_slice(&trailer);
+        bytes
+    }
+
+    /// Replaces a trailer field: 8 is the object count, 16 the top object, 24
+    /// the offset table.
+    fn with_trailer(mut bytes: Vec<u8>, field: usize, value: u64) -> Vec<u8> {
+        let start = bytes.len() - 32 + field;
+        bytes[start..start + 8].copy_from_slice(&value.to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn binary_with_a_huge_object_count_is_an_error() {
+        let good = binary_plist(&preset_value("000000"));
+        for count in [u64::MAX, 1 << 40, good.len() as u64 + 1] {
+            assert!(parse_binary(&with_trailer(good.clone(), 8, count)).is_err(), "{count}");
+        }
+    }
+
+    #[test]
+    fn binary_with_the_offset_table_past_the_end_is_an_error() {
+        let good = binary_plist(&preset_value("000000"));
+        for table in [u64::MAX, u64::MAX - 1, good.len() as u64, good.len() as u64 - 33] {
+            assert!(parse_binary(&with_trailer(good.clone(), 24, table)).is_err(), "{table}");
+        }
+    }
+
+    #[test]
+    fn binary_with_a_bad_top_object_is_an_error() {
+        let good = binary_plist(&preset_value("000000"));
+        assert!(parse_binary(&with_trailer(good, 16, u64::MAX)).is_err());
+    }
+
+    #[test]
+    fn binary_dict_that_holds_itself_is_an_error() {
+        // Object 0 is a dict whose one value is object 0.
+        let objects = [vec![0xD1, 1, 0], b"\x51a".to_vec()];
+        let error = parse_binary(&raw_plist(&objects, 0)).unwrap_err();
+        assert!(error.contains("too deep"), "{error}");
+        // The same through an array.
+        let objects = [vec![0xA1, 0]];
+        assert!(parse_binary(&raw_plist(&objects, 0)).is_err());
+    }
+
+    #[test]
+    fn binary_dicts_shared_many_times_over_are_an_error() {
+        // Each dict refers to the next one twice, so reading the first would
+        // build 2^40 dicts. The work limit stops it.
+        let levels = 40;
+        let mut objects: Vec<Vec<u8>> = (0..levels).map(|level| vec![0xD2, levels, levels, level + 1, level + 1]).collect();
+        objects.push(vec![0xD0]);
+        objects.push(b"\x51k".to_vec());
+        let error = parse_binary(&raw_plist(&objects, 0)).unwrap_err();
+        assert!(error.contains("too large"), "{error}");
+    }
+
+    #[test]
+    fn binary_with_overflowing_lengths_is_an_error() {
+        let huge = |marker: u8| {
+            let mut object = vec![marker, 0x13];
+            object.extend_from_slice(&u64::MAX.to_be_bytes());
+            object
+        };
+        // An ASCII string, a UTF-16 string, an array and a dict, each claiming
+        // 2^64 - 1 items.
+        for marker in [0x5F, 0x6F, 0xAF, 0xDF] {
+            assert!(parse_binary(&raw_plist(&[huge(marker)], 0)).is_err(), "{marker:x}");
+        }
+        // Lengths that fit in memory math but not in the file.
+        let mut object = vec![0xAF, 0x12];
+        object.extend_from_slice(&0x0100_0000u32.to_be_bytes());
+        assert!(parse_binary(&raw_plist(&[object], 0)).is_err());
+        // A length held in a 32 KB integer.
+        assert!(parse_binary(&raw_plist(&[vec![0x5F, 0x1F, 0]], 0)).is_err());
+    }
+
+    #[test]
+    fn binary_with_an_offset_at_the_end_of_memory_is_an_error() {
+        // Eight-byte offsets, with the one object at usize::MAX.
+        let mut bytes = b"bplist00".to_vec();
+        bytes.extend_from_slice(&[0; 8]);
+        let table = bytes.len();
+        bytes.extend_from_slice(&u64::MAX.to_be_bytes());
+        let mut trailer = [0u8; 32];
+        trailer[6] = 8;
+        trailer[7] = 1;
+        trailer[8..16].copy_from_slice(&1u64.to_be_bytes());
+        trailer[24..32].copy_from_slice(&(table as u64).to_be_bytes());
+        bytes.extend_from_slice(&trailer);
+        assert!(parse_binary(&bytes).is_err());
+    }
+
+    #[test]
+    fn binary_truncated_at_every_length_is_an_error_or_reads() {
+        let good = binary_plist(&preset_value("000000"));
+        for len in 0..good.len() {
+            let _ = parse_itermcolors(&good[..len]);
+        }
+    }
+
+    #[test]
+    fn xml_reader_rejects_malformed_markup() {
+        for text in [
+            "<!-- never closed",
+            "<!--",
+            "<a",
+            "<",
+            "</a>",
+            "</>",
+            "<>",
+            "<a></a></a>",
+            "<a/>trailing",
+            "<a>é<!-",
+            "<plist><dict><key>é</key><",
+        ] {
+            assert!(parse_xml(text).is_err(), "{text}");
+        }
+        assert!(parse_xml("<!---->").is_ok());
+        assert!(parse_xml("<a>é</a><!-- é -->").is_ok());
+    }
+
+    #[test]
+    fn xml_reader_rejects_deep_nesting() {
+        let depth = 100_000;
+        let text = "<a>".repeat(depth) + &"</a>".repeat(depth);
+        let error = parse_xml(&text).unwrap_err();
+        assert!(error.contains("too deep"), "{error}");
+        let text = "<a>".repeat(MAX_DEPTH) + &"</a>".repeat(MAX_DEPTH);
+        assert!(parse_xml(&text).is_ok());
     }
 
     #[test]

@@ -6,27 +6,34 @@
 #   D  command finished (payload: status) (PROMPT_COMMAND)
 #   7  working directory, as a file:// URI (PROMPT_COMMAND)
 #
+# Each mark ends with ";nonce=$BLOCO_NONCE", so the terminal can tell it from
+# marks a program prints. The nonce is kept in a shell variable and taken out
+# of the environment, so the commands the shell runs never see it.
+#
 # Sourced from the generated rcfile after the login files. The DEBUG trap is
 # ours, so a DEBUG trap set before this file is replaced.
 
 __term_session_running=
+__term_session_nonce=
+[[ -n $BLOCO_NONCE ]] && __term_session_nonce=";nonce=$BLOCO_NONCE"
+unset BLOCO_NONCE
 
 __term_session_report_cwd() {
   # A file URI: escape the characters that would break it. "%" first.
   local dir=${PWD//%/%25}
   dir=${dir// /%20}
-  printf '\033]7;file://%s%s\007' "$HOSTNAME" "$dir"
+  printf '\033]7;file://%s%s%s\007' "$HOSTNAME" "$dir" "$__term_session_nonce"
 }
 
 __term_session_precmd() {
   local exit_status=$?
-  printf '\033]133;D;%d\007' "$exit_status"
+  printf '\033]133;D;%d%s\007' "$exit_status" "$__term_session_nonce"
   __term_session_running=
   __term_session_report_cwd
   # The user's own prompt command runs here, so that bash does not run it as
   # a command of its own (which the DEBUG trap would report).
   eval "$__term_session_user_prompt_command"
-  printf '\033]133;A\007'
+  printf '\033]133;A%s\007' "$__term_session_nonce"
   return "$exit_status"
 }
 
@@ -50,7 +57,7 @@ __term_session_preexec() {
   # Control bytes would break the OSC framing, so blank them out.
   command=${command//$'\a'/ }
   command=${command//$'\e'/ }
-  printf '\033]133;C;%s\007' "$command"
+  printf '\033]133;C;%s%s\007' "$command" "$__term_session_nonce"
   return 0
 }
 
@@ -58,5 +65,5 @@ if [[ $PROMPT_COMMAND != __term_session_precmd ]]; then
   __term_session_user_prompt_command=$PROMPT_COMMAND
   PROMPT_COMMAND=__term_session_precmd
 fi
-PS1+='\[\e]133;B\a\]'
+PS1+='\[\e]133;B'"$__term_session_nonce"'\a\]'
 trap '__term_session_preexec' DEBUG

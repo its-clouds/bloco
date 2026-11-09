@@ -22,7 +22,7 @@ pub enum Mode {
     Files,
 }
 
-/// The sidebar as the workspace keeps it. Closed at startup.
+/// The sidebar as the workspace keeps it. Open on the Sessions list at startup.
 #[derive(Debug)]
 pub struct Sidebar {
     pub open: bool,
@@ -35,7 +35,8 @@ pub struct Sidebar {
 impl Default for Sidebar {
     fn default() -> Self {
         Self {
-            open: false,
+            // Open by default: the Sessions list is how sessions are switched.
+            open: true,
             mode: Mode::default(),
             tree: FileTree::default(),
             width: SIDEBAR_WIDTH,

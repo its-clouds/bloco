@@ -131,6 +131,28 @@ impl Default for WindowConfig {
     }
 }
 
+/// Terminal settings in `[terminal]`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TerminalConfig {
+    /// Whether programs may set the clipboard with OSC 52.
+    pub clipboard_write: ClipboardWrite,
+}
+
+/// Whether output may write the system clipboard with OSC 52. Any program can
+/// send it, a remote one over ssh too. Reads are never answered.
+///
+/// In TOML: `"allow"` or `"deny"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClipboardWrite {
+    /// OSC 52 replaces the clipboard.
+    #[default]
+    Allow,
+    /// OSC 52 is ignored.
+    Deny,
+}
+
 /// The top-level keys of `config.toml`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -141,6 +163,7 @@ pub struct Config {
     pub theme: String,
     pub option_as_meta: OptionAsMeta,
     pub window: WindowConfig,
+    pub terminal: TerminalConfig,
 }
 
 impl Default for Config {
@@ -150,6 +173,7 @@ impl Default for Config {
             theme: "dark".into(),
             option_as_meta: OptionAsMeta::default(),
             window: WindowConfig::default(),
+            terminal: TerminalConfig::default(),
         }
     }
 }
@@ -339,6 +363,32 @@ mod tests {
         let settings = parse(Some("[window]\nbackground_opacity = 0.85\nbackground_blur = true\n")).unwrap();
         assert_eq!(settings.config.window.background_opacity, 0.85);
         assert!(settings.config.window.background_blur);
+    }
+
+    #[test]
+    fn clipboard_write_defaults_to_allow() {
+        let settings = parse(None).unwrap();
+        assert_eq!(settings.config.terminal.clipboard_write, ClipboardWrite::Allow);
+        let settings = parse(Some("[terminal]\n")).unwrap();
+        assert_eq!(settings.config.terminal.clipboard_write, ClipboardWrite::Allow);
+    }
+
+    #[test]
+    fn clipboard_write_accepts_allow_and_deny() {
+        let value = |text: &str| {
+            parse(Some(&format!("[terminal]\nclipboard_write = {text}\n"))).map(|s| s.config.terminal.clipboard_write)
+        };
+        assert_eq!(value("\"allow\""), Ok(ClipboardWrite::Allow));
+        assert_eq!(value("\"deny\""), Ok(ClipboardWrite::Deny));
+    }
+
+    #[test]
+    fn clipboard_write_rejects_other_values() {
+        let error = parse(Some("[terminal]\nclipboard_write = \"ask\"\n")).unwrap_err();
+        assert!(error.starts_with("config.toml:"), "{error}");
+        assert!(error.contains("ask"), "{error}");
+        assert!(parse(Some("[terminal]\nclipboard_write = true\n")).is_err());
+        assert!(parse(Some("[terminal]\nclipboard = \"deny\"\n")).is_err());
     }
 
     #[test]

@@ -245,7 +245,9 @@ impl Element for TerminalElement {
         // The editor's rows in the dock. Each row past the first grows the dock
         // upward over the bottom of the grid, and those grid rows are not drawn.
         let editor = self.editor.as_ref().filter(|_| docked);
-        let dock_editor = editor.map(|draw| DockEditor::new(draw, columns));
+        // No ghost text while an input method is composing: the preedit is drawn at the cursor.
+        let composing = self.marked_text.as_deref().is_some_and(|t| !t.is_empty());
+        let dock_editor = editor.map(|draw| DockEditor::new(draw, columns, composing));
         let grown = dock_editor.as_ref().map_or(0, |dock| dock.rows.len() - 1);
         let dock_top = (bounds.origin.y + bounds.size.height
             - dock_height(line_height)
@@ -620,7 +622,7 @@ impl TerminalElement {
             return;
         };
 
-        let chars: Vec<char> = draw.text.chars().collect();
+        let chars = dock.chars.as_slice();
         // The preedit covers the cells from the cursor on, so the editor's text there is skipped.
         let cover = preedit.zip(dock.cursor).map(|(text, (row, column))| {
             let width: usize = text.chars().map(char_width).sum();
@@ -635,7 +637,8 @@ impl TerminalElement {
                 out,
                 &editor_metrics,
                 draw,
-                &chars,
+                chars,
+                dock.text_len,
                 range.clone(),
                 row,
                 covered,
@@ -680,7 +683,7 @@ impl TerminalElement {
         }
 
         // An empty editor says what to type, after the cursor.
-        if chars.is_empty() && preedit.is_none() {
+        if draw.text.is_empty() && preedit.is_none() {
             let text = "Type a command";
             let batch = Batch {
                 start: 1,
@@ -706,6 +709,7 @@ impl TerminalElement {
         metrics: &Metrics,
         draw: &EditorDraw,
         chars: &[char],
+        text_len: usize,
         range: Range<usize>,
         line: usize,
         covered: Option<Range<usize>>,
@@ -713,14 +717,24 @@ impl TerminalElement {
         let mut column = 0;
         let mut batch: Option<Batch> = None;
         for run in prompt::runs(&draw.spans, range) {
-            let fg = prompt::color(run.kind, &self.palette);
-            for &c in &chars[run.start..run.end] {
+            for (offset, &c) in chars[run.start..run.end].iter().enumerate() {
                 let width = char_width(c);
                 let is_covered = covered.as_ref().is_some_and(|cover| cover.contains(&column));
                 if is_covered {
                     flush(window, self, out, metrics, line, &mut batch);
                     column += width;
                     continue;
+                }
+                let index = run.start + offset;
+                // The suggestion past the editor text is drawn muted.
+                let fg = if index >= text_len {
+                    self.palette.chrome.muted
+                } else {
+                    prompt::color(run.kind, &self.palette)
+                };
+                if draw.selection.as_ref().is_some_and(|sel| sel.contains(&index)) {
+                    out.rects
+                        .push((metrics.cell_bounds(line, column, width), self.palette.selection));
                 }
                 let joins = width == 1
                     && batch
@@ -1103,16 +1117,31 @@ struct DockEditor {
     rows: Vec<Range<usize>>,
     /// The editor's cursor as (row, column), when it is on a shown row.
     cursor: Option<(usize, usize)>,
+    /// The editor text followed by the suggestion, which wraps with it. The rows index into it.
+    chars: Vec<char>,
+    /// How many chars at the start of `chars` are the editor text. The rest is the suggestion.
+    text_len: usize,
 }
 
 impl DockEditor {
-    fn new(draw: &EditorDraw, columns: usize) -> Self {
-        let chars: Vec<char> = draw.text.chars().collect();
+    /// `composing` is true while an input method has a preedit. The suggestion
+    /// is then left out, because the preedit is drawn at the cursor.
+    fn new(draw: &EditorDraw, columns: usize, composing: bool) -> Self {
+        let mut chars: Vec<char> = draw.text.chars().collect();
+        let text_len = chars.len();
+        if !composing && let Some(suggestion) = &draw.suggestion {
+            chars.extend(suggestion.chars());
+        }
         let all = input_editor::wrap(&chars, columns, columns);
         let (row, column) = input_editor::position(&all, draw.cursor);
         let cursor = (row < MAX_DOCK_ROWS).then_some((row, column));
         let rows = all.into_iter().take(MAX_DOCK_ROWS).collect();
-        Self { rows, cursor }
+        Self {
+            rows,
+            cursor,
+            chars,
+            text_len,
+        }
     }
 }
 

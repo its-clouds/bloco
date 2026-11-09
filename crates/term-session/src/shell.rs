@@ -1,12 +1,12 @@
 //! Shell integration: how each supported shell is started so that it reports
 //! prompts, commands and the working directory (OSC 133 and OSC 7).
 //!
-//! The scripts are written to a private temporary directory, which is removed
+//! The scripts are written to a private temporary directory (random name,
+//! mode 0700, files 0600), which is removed
 //! when the session ends. The user's own files are read but never changed.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
 use portable_pty::CommandBuilder;
@@ -28,14 +28,9 @@ done
 unset __term_session_file
 "#;
 
-/// The directory holding the generated scripts. Removed on drop.
-pub(crate) struct ScriptDir(PathBuf);
-
-impl Drop for ScriptDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+/// The directory holding the generated scripts: its path, and the guard
+/// that removes it on drop.
+pub(crate) struct ScriptDir(PathBuf, #[allow(dead_code)] tempfile::TempDir);
 
 /// Adds the arguments and environment that start `shell` (a path) as a login
 /// shell with the integration. Returns the script directory, which must live
@@ -91,16 +86,31 @@ fn name(shell: &str) -> Option<&str> {
     Path::new(shell).file_name().and_then(OsStr::to_str)
 }
 
-/// Writes `files` into a new directory unique to this process and session.
+/// Writes `files` into a new private directory, one per session.
+///
+/// The shell sources these files, so another local user must not be able to
+/// plant or swap them. The directory gets a random name and mode 0700, and
+/// creation fails if it exists. Each file is created new with mode 0600, so a
+/// planted file or symlink is an error, not a target.
 fn write_dir(files: &[(&str, String)]) -> Result<ScriptDir> {
-    // Unique per session: several sessions can exist in one process (tabs, splits).
-    static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let dir =
-        ScriptDir(std::env::temp_dir().join(format!("term-session-{}-{id}", std::process::id())));
-    std::fs::create_dir_all(&dir.0).context("create script directory")?;
+    use std::io::Write;
+
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("bloco-shell-");
+    // tempfile follows the umask for directories, so the mode is set here.
+    #[cfg(unix)]
+    builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700));
+    let temp = builder.tempdir().context("create script directory")?;
+    let dir = ScriptDir(temp.path().to_path_buf(), temp);
     for (file, text) in files {
-        std::fs::write(dir.0.join(file), text).with_context(|| format!("write {file}"))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        options
+            .open(dir.0.join(file))
+            .and_then(|mut f| f.write_all(text.as_bytes()))
+            .with_context(|| format!("write {file}"))?;
     }
     Ok(dir)
 }
@@ -206,6 +216,40 @@ mod tests {
     #[test]
     fn fish_reports_command_and_exit_status() {
         reports_command_and_exit_status("fish");
+    }
+
+    /// A command prints marks of its own. Without the session's nonce they are
+    /// ignored, and the command cannot read the nonce from its environment.
+    fn ignores_marks_printed_by_a_command(name: &str) {
+        let Some(shell) = find_shell(name) else {
+            eprintln!("skipping: {name} is not installed");
+            return;
+        };
+        let session = Session::spawn_shell(&shell, 100, 24, None, |_| {}).unwrap();
+        let command = r#"sh -c 'printf "\033]133;D;42\007\033]7;file://x/forged\007"; echo "nonce:${BLOCO_NONCE:-unset}"'"#;
+        session.write(format!("{command}\r").as_bytes()).unwrap();
+        wait_for_finished(&session, 1);
+        let blocks = session.blocks();
+        let block = blocks.iter().find(|b| b.exit_code.is_some()).unwrap();
+        assert_eq!(block.exit_code, Some(0), "{name}");
+        assert_eq!(block.command.as_deref(), Some(command), "{name}");
+        assert_eq!(session.block_output(block.id).as_deref(), Some("nonce:unset"), "{name}");
+        assert_ne!(session.cwd(), Some(PathBuf::from("/forged")), "{name}");
+    }
+
+    #[test]
+    fn bash_ignores_marks_printed_by_a_command() {
+        ignores_marks_printed_by_a_command("bash");
+    }
+
+    #[test]
+    fn zsh_ignores_marks_printed_by_a_command() {
+        ignores_marks_printed_by_a_command("zsh");
+    }
+
+    #[test]
+    fn fish_ignores_marks_printed_by_a_command() {
+        ignores_marks_printed_by_a_command("fish");
     }
 
     /// The editor's submit: once the shell is at its prompt, the line goes to the
@@ -519,5 +563,27 @@ mod tests {
         assert!(path.join("file").exists());
         drop(dir);
         assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn script_directory_and_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = write_dir(&[("a", "1".into()), ("b", "2".into())]).unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir.0), 0o700);
+        assert_eq!(mode(&dir.0.join("a")), 0o600);
+        assert_eq!(mode(&dir.0.join("b")), 0o600);
+        assert_eq!(std::fs::read_to_string(dir.0.join("a")).unwrap(), "1");
+    }
+
+    #[test]
+    fn script_directories_have_distinct_random_names() {
+        let a = write_dir(&[]).unwrap();
+        let b = write_dir(&[]).unwrap();
+        assert_ne!(a.0, b.0);
+        let name = a.0.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("bloco-shell-"), "{name}");
     }
 }

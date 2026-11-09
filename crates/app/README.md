@@ -1,6 +1,6 @@
 # crates/app
 
-The GPUI binary: one window with tabs, split panes and a command palette. Everything
+The GPUI binary: one window with sessions, split panes and a command palette. Everything
 that touches GPUI lives here. `crates/term-session` and `crates/config` have no GPUI
 dependency.
 
@@ -15,6 +15,9 @@ dependency.
 | `palette.rs` | Command palette state, fuzzy filter, shortcut text (unit tests) |
 | `terminal_view.rs` | One pane: keyboard, mouse, clipboard, scrollback, IME, Option as Meta, and its find bar. Emits `TerminalEvent`s to the workspace |
 | `find.rs` | Find bar state: query, toggles, matches, current match, counter, highlighted cells (unit tests) |
+| `file_links.rs` | Resolves a path printed in the terminal (`~`, relative to the block's directory) and reveals it in Finder (unit tests) |
+| `preview.rs` | What the file preview shows: the file read from disk, Markdown parsed into blocks, size and binary checks (unit tests) |
+| `file_viewer.rs` | The file preview panel: header with ×, rendered Markdown or plain monospace text. Emits `FileViewerEvent::Close` |
 | `terminal_element.rs` | Draws the grid: cell metrics, resize to the window, background runs, text runs, cursor |
 | `keys.rs` | Keystroke to escape sequence mapping (adapted from Zed), and the command-line text edits (`TextEdit`) |
 | `mouse.rs` | Mouse and wheel report encoding (adapted from Zed) |
@@ -28,11 +31,18 @@ These are the defaults. `keymap.toml` can change any of them (see below).
 | Action | Keys | Command id |
 | --- | --- | --- |
 | Command palette | Cmd+Shift+P, Cmd+P | `palette.toggle` |
-| New tab | Cmd+T | `tab.new` |
-| Close pane (closes the tab with its last pane, the window with its last tab) | Cmd+W | `pane.close` |
-| Close tab (all its panes). The × on the tab, or a middle-click on it, does the same | none, palette only | `tab.close` |
-| Previous / next tab | Cmd+{ / Cmd+} (Cmd+Shift+[ and ] on a US layout) | `tab.previous`, `tab.next` |
-| Go to tab 1 to 9 | Cmd+1 to Cmd+9 | `tab.select.1` to `tab.select.9` |
+| New session (also the + in the sidebar) | Cmd+T | `tab.new` |
+| Close pane (closes the session with its last pane, the window with its last session) | Cmd+W | `pane.close` |
+| Close session (all its panes). The × on its sidebar row does the same | none, palette only | `tab.close` |
+| Previous / next session | Cmd+{ / Cmd+} (Cmd+Shift+[ and ] on a US layout) | `tab.previous`, `tab.next` |
+| Go to session 1 to 9 | Cmd+1 to Cmd+9 | `tab.select.1` to `tab.select.9` |
+| Move the active session up / down in the Sessions list | Cmd+Ctrl+← / Cmd+Ctrl+→ | `tab.move_left`, `tab.move_right` |
+| Rename the session (also a double-click on its sidebar row). Enter commits, Esc cancels, a blank name clears it | none, palette only | `tab.rename` |
+| Drag a row in the Sessions list onto another row (it takes that row's place and group: after it when dragged down, before it when dragged up), onto a group header (it joins the group), or onto the space below the list (it leaves its group). An accent line shows where it lands; the drop is where the mouse last was, so a release between rows still counts. Released over the panes, the drag is cancelled. A click without a move only selects | mouse | none |
+| Rename the active pane. Shown in the row while the session has no name of its own | none, palette only | `pane.rename` |
+| Move the session to a group, or to no group | none, palette only | `tab.move_to_group` |
+| New group (also the ⊞ in the sidebar: takes the active session into it and starts naming it). Click a group's name to rename it, its × to delete it (its sessions stay) | none, palette only | `group.new`, `group.rename`, `group.delete` |
+| Move the active pane to a new session, or into another session beside its active pane | none, palette only | `pane.move_to_new_tab`, `pane.move_to_tab` |
 | Split right / split down | Cmd+D / Cmd+Shift+D | `pane.split_right`, `pane.split_down` |
 | Focus the pane left, right, above, below | Cmd+Opt+arrows | `pane.focus_left`, ... |
 | Copy / paste | Cmd+C / Cmd+V | `edit.copy`, `edit.paste` |
@@ -42,6 +52,10 @@ These are the defaults. `keymap.toml` can change any of them (see below).
 | Find (opens the bar, or selects its query when open) | Cmd+F | `find.open` |
 | Next match (older) / previous match (newer) | Cmd+G / Cmd+Shift+G, or Enter / Shift+Enter in the bar | `find.next`, `find.previous` |
 | Close the find bar | Esc in the bar, or its ×. No key in the terminal (Esc belongs to the shell) | `find.close` |
+| Cmd+click a path in the output: reveals a file in Finder, opens a directory in Finder. Relative paths resolve in the directory the command ran in | mouse | none |
+| Cmd+Shift+click a file path in the output: opens it in the preview panel beside the pane | mouse | none |
+| Cmd+click a file in the sidebar's Files tree: opens it in the preview panel (a plain click still inserts its path) | mouse | none |
+| Close the file preview panel: its ×, or Esc while the panel has focus (click it first) | Esc, or ×. Palette: Close File Preview | `preview.close` |
 | Zoom in (font +1 pt) | Cmd+= or Cmd++ (Cmd+Shift+=) | `view.zoom_in` |
 | Zoom out (font −1 pt) | Cmd+- | `view.zoom_out` |
 | Reset zoom to the size in `config.toml` | Cmd+0 | `view.zoom_reset` |
@@ -200,9 +214,10 @@ shaders, so startup is a little slower.
 - The find input takes typed text only (no IME), and has no movable cursor.
 - Warp's "search within the selected block" toggle waits for blocks (M3).
 
-- Cmd+W closes the focused pane. Closing a whole tab is the palette's "Close tab", the
-  tab's × or a middle-click on the tab.
-- The tab bar is always shown.
+- Cmd+W closes the focused pane. Closing a whole session is the palette's "Close session"
+  or the × on its sidebar row.
+- There is no tab bar. The title bar shows the active session's title, and sessions are
+  listed in the sidebar, which opens on the Sessions list at startup. Renaming opens it.
 - The palette takes typed text only. IME composition does not reach it.
 - Left and right Option are told apart with the keyboard device flags (CoreGraphics).
   This has not been checked on hardware yet (see `docs/m2-checklist.md`).

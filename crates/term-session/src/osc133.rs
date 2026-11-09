@@ -2,6 +2,26 @@
 //!
 //! The scanner sees the raw PTY bytes before `alacritty_terminal` does. The VT
 //! core ignores both codes, so the bytes still go to the parser unchanged.
+//!
+//! Any program can print these codes, so a session with shell integration
+//! gets a random nonce (see [`new_nonce`]). The shell gets it in the
+//! `BLOCO_NONCE` environment variable, keeps it in a shell variable, and takes
+//! it out of the environment so that the commands it runs never see it. Each
+//! mark the integration sends ends with `;nonce=<value>`:
+//!
+//! ```text
+//! ESC ] 133 ; A ; nonce=0123456789abcdef BEL
+//! ESC ] 133 ; C ; ls -l ; nonce=0123456789abcdef BEL
+//! ESC ] 133 ; D ; 0 ; nonce=0123456789abcdef BEL
+//! ESC ] 7 ; file://host/some/dir ; nonce=0123456789abcdef BEL
+//! ```
+//!
+//! The nonce is always the last field, so a command line or a directory with
+//! `;` in it still reads right: the scanner removes the exact suffix
+//! `;nonce=<value>` from the end, then parses the rest as before. A scanner
+//! made with [`Scanner::with_nonce`] drops every mark without the session's
+//! nonce. A scanner without a nonce (a shell with no integration) takes every
+//! mark, as before.
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
@@ -80,6 +100,30 @@ enum State {
     OscEscape,
 }
 
+/// A new random nonce: 16 hex digits from `/dev/urandom`. Where that cannot
+/// be read, std's per-process random hash keys are used instead.
+pub(crate) fn new_nonce() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    use std::io::Read;
+
+    let mut bytes = [0u8; 8];
+    let read = std::fs::File::open("/dev/urandom").and_then(|mut file| file.read_exact(&mut bytes));
+    if read.is_err() {
+        bytes = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish()
+            .to_be_bytes();
+    }
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The payload without its `;nonce=<nonce>` suffix. `None` when the payload
+/// does not end with that suffix.
+fn strip_nonce<'a>(payload: &'a [u8], nonce: &str) -> Option<&'a [u8]> {
+    let rest = payload.strip_suffix(nonce.as_bytes())?;
+    rest.strip_suffix(b";nonce=")
+}
+
 /// Byte-at-a-time OSC scanner. It keeps its state between `feed` calls, so
 /// a sequence split across PTY reads still parses.
 #[derive(Default)]
@@ -87,9 +131,20 @@ pub struct Scanner {
     state: State,
     payload: Vec<u8>,
     overflow: bool,
+    /// The session's nonce. With one, marks without it are dropped.
+    nonce: Option<String>,
 }
 
 impl Scanner {
+    /// A scanner that only takes marks that end with `;nonce=<nonce>`. `None`
+    /// takes every mark, for shells without the integration.
+    pub fn with_nonce(nonce: Option<String>) -> Self {
+        Self {
+            nonce,
+            ..Self::default()
+        }
+    }
+
     /// Feeds raw PTY bytes and calls `on_mark` for each complete OSC 133 sequence.
     pub fn feed(&mut self, bytes: &[u8], mut on_mark: impl FnMut(Mark)) {
         self.scan(bytes, |mark, _| on_mark(mark));
@@ -139,7 +194,14 @@ impl Scanner {
         if self.overflow {
             return;
         }
-        if let Some(mark) = parse_payload(&self.payload) {
+        let payload = match &self.nonce {
+            Some(nonce) => match strip_nonce(&self.payload, nonce) {
+                Some(payload) => payload,
+                None => return,
+            },
+            None => &self.payload,
+        };
+        if let Some(mark) = parse_payload(payload) {
             on_mark(mark, end);
         }
     }
@@ -243,6 +305,76 @@ mod tests {
     fn ignores_non_osc_escape_sequences() {
         let stream = b"\x1b[31mred\x1b[0m\x1b7\x1b8\x1b]0;title\x07";
         assert!(marks_of(&[stream]).is_empty());
+    }
+
+    fn marks_with_nonce(nonce: &str, stream: &[u8]) -> Vec<Mark> {
+        let mut scanner = Scanner::with_nonce(Some(nonce.into()));
+        let mut marks = Vec::new();
+        scanner.feed(stream, |m| marks.push(m));
+        marks
+    }
+
+    const NONCE: &str = "0123456789abcdef";
+
+    #[test]
+    fn nonce_marks_parse_without_the_nonce() {
+        let stream = b"\x1b]133;A;nonce=0123456789abcdef\x07\
+            \x1b]133;B;nonce=0123456789abcdef\x1b\\\
+            \x1b]133;C;echo a;b; nonce=x;nonce=0123456789abcdef\x07\
+            \x1b]133;D;3;nonce=0123456789abcdef\x07\
+            \x1b]7;file://h/tmp/a;b;nonce=0123456789abcdef\x07";
+        assert_eq!(
+            marks_with_nonce(NONCE, stream),
+            vec![
+                Mark::PromptStart,
+                Mark::PromptEnd,
+                Mark::CommandStart {
+                    command: Some("echo a;b; nonce=x".into())
+                },
+                Mark::CommandEnd { exit_code: Some(3) },
+                Mark::Cwd("/tmp/a;b".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn forged_marks_are_dropped_when_the_session_has_a_nonce() {
+        for forged in [
+            &b"\x1b]133;A\x07"[..],
+            b"\x1b]133;D;0\x07",
+            b"\x1b]133;C;rm -rf ~\x07",
+            b"\x1b]7;file://h/etc\x07",
+            // A wrong nonce, a nonce of another length, and one that is not last.
+            b"\x1b]133;A;nonce=fedcba9876543210\x07",
+            b"\x1b]133;A;nonce=0123456789abcde\x07",
+            b"\x1b]133;A;nonce=0123456789abcdef0\x07",
+            b"\x1b]133;D;nonce=0123456789abcdef;0\x07",
+            b"\x1b]133;A;0123456789abcdef\x07",
+            b"\x1b]133;Anonce=0123456789abcdef\x07",
+        ] {
+            assert!(
+                marks_with_nonce(NONCE, forged).is_empty(),
+                "{}",
+                String::from_utf8_lossy(forged)
+            );
+        }
+    }
+
+    #[test]
+    fn without_a_nonce_every_mark_is_taken() {
+        let stream = b"\x1b]133;A\x07\x1b]7;file://h/tmp\x07";
+        assert_eq!(
+            marks_of(&[stream]),
+            vec![Mark::PromptStart, Mark::Cwd("/tmp".into())]
+        );
+    }
+
+    #[test]
+    fn nonces_are_sixteen_hex_digits_and_differ() {
+        let (a, b) = (new_nonce(), new_nonce());
+        assert_eq!(a.len(), 16);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()), "{a}");
+        assert_ne!(a, b);
     }
 
     #[test]

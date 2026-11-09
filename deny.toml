@@ -1,0 +1,59 @@
+# cargo-deny configuration: https://embarkstudios.github.io/cargo-deny/
+# CI runs `cargo deny check` on every pull request (see .github/workflows/ci.yml).
+
+[graph]
+# The platforms Bloco ships on. Windows-only crates are left out of the checks.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+all-features = false
+
+[advisories]
+# Unmaintained crates are reported only when the workspace depends on them
+# directly. The ones that come with GPUI are tracked upstream.
+unmaintained = "workspace"
+yanked = "deny"
+# Nothing ignored. `cargo audit` (which checks every platform) also reports
+# quick-xml 0.30 (RUSTSEC-2026-0194/0195) through `xcb`; xcb is not built for
+# the targets above, and only reads the protocol XML shipped in the crate.
+ignore = []
+
+[licenses]
+# Every license here must be compatible with distributing Bloco under GPL-3.0-only.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "GPL-3.0-only",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# GPUI and the forks its build patches in. Keep in sync with the [patch]
+# table in the root Cargo.toml.
+allow-git = [
+    "https://github.com/zed-industries/zed",
+    "https://github.com/zed-industries/async-task.git",
+    "https://github.com/zed-industries/font-kit",
+    "https://github.com/zed-industries/oo7",
+]

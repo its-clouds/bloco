@@ -15,23 +15,26 @@ use std::time::Duration;
 
 use config::{Config, Files, Settings};
 use gpui::{
-    Action, AnyElement, App, Bounds, Context, Entity, EntityId, FocusHandle, Focusable, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    Action, AnyElement, App, Bounds, Context, ElementId, Entity, EntityId, FocusHandle, Focusable, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PathPromptOptions, Pixels, Render, Subscription, Window, WindowBackgroundAppearance, canvas, div, prelude::*, px, relative,
 };
 use term_session::{Color, NamedColor, Session, SessionEvent};
 
 use crate::block_header::display_dir;
 use crate::colors::{Chrome, Palette};
+use crate::file_viewer::{FileViewer, FileViewerEvent};
 use crate::commands::{
-    self, ClosePane, CloseTab, FocusDown, FocusLeft, FocusRight, FocusUp, ImportTheme, NewTab,
-    NextTab, OpenSettings, PreviousTab, SelectTab, ShowFiles, ShowSessions, SplitDown, SplitRight,
-    TogglePalette, ToggleSidebar, ZoomIn, ZoomOut, ZoomReset,
+    self, ClosePane, ClosePreview, CloseTab, FocusDown, FocusLeft, FocusRight, FocusUp, ImportTheme, MoveTabLeft,
+    MoveTabRight, MoveTabToGroup, NewGroup, NewTab, NextTab, OpenSettings, PreviousTab, RenameGroup,
+    RenameTab, RenamePane, DeleteGroup, SelectTab, ShowFiles, ShowSessions, SplitDown, SplitRight, TogglePalette,
+    ToggleSidebar, ZoomIn, ZoomOut, ZoomReset, MovePaneToNewTab, MovePaneToTab,
 };
-use crate::layout::{self, SavedLayout, SavedNode, SavedTab};
+use crate::layout::{self, SavedGroup, SavedLayout, SavedNode, SavedTab};
 use crate::palette::{PaletteState, pretty_keys};
 use crate::settings::{self as settings_rows, Setting};
 use crate::sidebar::{self, Mode, SIDEBAR_WIDTH, Sidebar};
 use crate::split_tree::{Axis, DIVIDER, Direction, MAX_RATIO, MIN_RATIO, Node, Rect, SplitTree};
+use crate::tab_groups::{self, Group, GroupId, Grouped};
 use crate::terminal_view::{TerminalEvent, TerminalStyle, TerminalView};
 use crate::zoom;
 
@@ -39,7 +42,6 @@ use crate::zoom;
 const FALLBACK_FONT: &str = "Menlo";
 /// The title bar holds the tabs. It is always shown.
 const TAB_BAR_HEIGHT: f32 = 38.0;
-const TAB_HEIGHT: f32 = 26.0;
 /// Room on the left of the title bar for the macOS traffic lights.
 const TRAFFIC_LIGHT_PADDING: f32 = 90.0;
 /// The grab area around a divider. Wider than the 1px line it marks.
@@ -53,10 +55,90 @@ const SETTINGS_POLL: Duration = Duration::from_millis(500);
 const SETTINGS_TOP: f32 = 60.0;
 const SETTINGS_WIDTH: f32 = 480.0;
 
-/// One tab: its panes and the pane that has the keyboard.
+/// A file open beside a tab's panes. The subscription is dropped with it.
+struct Preview {
+    viewer: Entity<FileViewer>,
+    _close: Subscription,
+}
+
+/// One tab: its panes, the pane that has the keyboard, and the name and group
+/// the user gave it.
 struct Tab {
     panes: SplitTree<Entity<TerminalView>>,
     active: Entity<TerminalView>,
+    /// The name the user gave the tab. `None` shows the automatic title.
+    name: Option<String>,
+    group: Option<GroupId>,
+    /// The file preview panel, when one is open. Not saved in the layout.
+    preview: Option<Preview>,
+}
+
+impl Tab {
+    fn new(panes: SplitTree<Entity<TerminalView>>, active: Entity<TerminalView>) -> Self {
+        Self {
+            panes,
+            active,
+            name: None,
+            group: None,
+            preview: None,
+        }
+    }
+
+    /// The name the user gave the tab, or else the title of its active pane.
+    fn title(&self, cx: &App) -> String {
+        self.name
+            .clone()
+            .unwrap_or_else(|| self.active.read(cx).tab_title())
+    }
+}
+
+impl Grouped for Tab {
+    fn group(&self) -> Option<GroupId> {
+        self.group
+    }
+
+    fn set_group(&mut self, group: Option<GroupId>) {
+        self.group = group;
+    }
+}
+
+/// Where a session dragged in the sidebar goes when the button is released:
+/// the last place the mouse was over, so a release over a gap still counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionDrop {
+    /// Takes this row's place and group.
+    Row(usize),
+    /// Joins this group, at the end of its run.
+    Group(GroupId),
+    /// Leaves its group.
+    NoGroup,
+}
+
+/// A name being typed in a sidebar row, in place of the title.
+#[derive(Debug, Clone, PartialEq)]
+enum Renaming {
+    Tab { index: usize, text: String },
+    Group { id: GroupId, text: String },
+    /// A session's name, typed in its tab's title. `pane` is the session.
+    Pane { pane: EntityId, text: String },
+}
+
+/// What a row of a picker does when it is chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pick {
+    /// Puts the active tab in this group, or in no group.
+    Group(Option<GroupId>),
+    NewGroup,
+    /// Moves the active pane into this tab, beside its active pane.
+    Tab(usize),
+}
+
+/// A list over the workspace, drawn where the palette is: "Move Tab to Group"
+/// and "Move Session to Tab". Each row has a label and what it does.
+#[derive(Debug)]
+struct Picker {
+    rows: Vec<(String, Pick)>,
+    selected: usize,
 }
 
 /// A divider being dragged: the path to its split in the tree.
@@ -106,6 +188,19 @@ pub struct Workspace {
     palette: Option<PaletteState>,
     palette_focus: FocusHandle,
     divider_drag: Option<DividerDrag>,
+    /// The name being typed, if a tab is being renamed.
+    renaming: Option<Renaming>,
+    /// The index of the tab whose row is being dragged in the sidebar, while the button is held.
+    session_drag: Option<usize>,
+    /// Where that row drops if the button is released now.
+    session_drop: Option<SessionDrop>,
+    /// The tab groups, in the order they were made.
+    groups: Vec<Group>,
+    /// The id the next group gets. Ids are not reused.
+    next_group_id: GroupId,
+    /// Open while choosing a group or a tab for the active tab or pane.
+    picker: Option<Picker>,
+    rename_focus: FocusHandle,
     /// Whether the sidebar's edge is being dragged.
     sidebar_drag: bool,
     /// The area that holds the panes, measured while painting.
@@ -153,6 +248,13 @@ impl Workspace {
             palette: None,
             palette_focus: cx.focus_handle(),
             divider_drag: None,
+            renaming: None,
+            session_drag: None,
+            session_drop: None,
+            groups: Vec::new(),
+            next_group_id: 1,
+            picker: None,
+            rename_focus: cx.focus_handle(),
             sidebar_drag: false,
             content_area: Rc::new(Cell::new(Bounds::default())),
             last_saved: None,
@@ -162,10 +264,7 @@ impl Workspace {
         if !workspace.restore_layout(window, cx) {
             match workspace.add_pane(None, window, cx) {
                 Ok(pane) => {
-                    workspace.tabs.push(Tab {
-                        panes: SplitTree::new(pane.clone()),
-                        active: pane,
-                    });
+                    workspace.tabs.push(Tab::new(SplitTree::new(pane.clone()), pane));
                     workspace.focus_active(window, cx);
                 }
                 Err(e) => workspace.error = Some(e),
@@ -234,6 +333,11 @@ impl Workspace {
                 }
             }
             TerminalEvent::Exited => self.close_pane(pane, window, cx),
+            TerminalEvent::OpenPreview(path) => {
+                if let Some(index) = self.tab_index_of(pane) {
+                    self.open_preview(index, path.clone(), window, cx);
+                }
+            }
         }
     }
 
@@ -260,6 +364,510 @@ impl Workspace {
         }
     }
 
+    /// The session with this id, in any tab.
+    fn pane_with_id(&self, id: EntityId) -> Option<Entity<TerminalView>> {
+        self.tabs
+            .iter()
+            .flat_map(|tab| tab.panes.leaves())
+            .find(|pane| pane.entity_id() == id)
+    }
+
+    /// Starts renaming the active session. The editor opens in the active tab's title.
+    fn rename_pane_action(&mut self, _: &RenamePane, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pane) = self.active_pane() else {
+            return;
+        };
+        self.reveal_sessions();
+        let text = pane.read(cx).tab_title();
+        self.renaming = Some(Renaming::Pane {
+            pane: pane.entity_id(),
+            text,
+        });
+        window.focus(&self.rename_focus, cx);
+        cx.notify();
+    }
+
+    /// Opens the sidebar on the Sessions list, where the rename editors are drawn.
+    fn reveal_sessions(&mut self) {
+        self.sidebar.open = true;
+        self.sidebar.mode = Mode::Sessions;
+    }
+
+    /// Starts renaming the active session. The editor opens in its sidebar row.
+    fn rename_tab_action(&mut self, _: &RenameTab, window: &mut Window, cx: &mut Context<Self>) {
+        let index = self.active_tab;
+        if let Some(tab) = self.tabs.get(index) {
+            let text = tab.name.clone().unwrap_or_else(|| tab.title(cx));
+            self.reveal_sessions();
+            self.renaming = Some(Renaming::Tab { index, text });
+            window.focus(&self.rename_focus, cx);
+            cx.notify();
+        }
+    }
+
+    /// Moves the active session one place up or down in the Sessions list. Its group
+    /// follows the neighbour it passes, as in `tab_groups::move_tab`.
+    fn move_active_tab(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let from = self.active_tab;
+        let Some(to) = from.checked_add_signed(delta).filter(|&to| to < self.tabs.len()) else {
+            return;
+        };
+        self.reorder_tab(from, to, cx);
+    }
+
+    fn move_tab_left(&mut self, _: &MoveTabLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_active_tab(-1, cx);
+    }
+
+    fn move_tab_right(&mut self, _: &MoveTabRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_active_tab(1, cx);
+    }
+
+    /// Moves the tab at `from` to `to` and keeps the active tab selected.
+    fn reorder_tab(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        self.active_tab = tab_groups::follow(self.active_tab, from, to);
+        tab_groups::move_tab(&mut self.tabs, from, to);
+        cx.notify();
+    }
+
+    /// Ends the rename in progress. `commit` keeps the typed name (blank clears
+    /// it). Otherwise the name is left as it was.
+    fn finish_rename(&mut self, commit: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(renaming) = self.renaming.take() else {
+            return;
+        };
+        match renaming {
+            Renaming::Tab { index, text } => {
+                if let (true, Some(tab)) = (commit, self.tabs.get_mut(index)) {
+                    tab.name = tab_groups::clean_name(&text);
+                }
+            }
+            Renaming::Group { id, text } => {
+                // A group keeps its old name when the new one is blank.
+                let name = tab_groups::clean_name(&text);
+                if let (true, Some(name), Some(group)) =
+                    (commit, name, self.groups.iter_mut().find(|group| group.id == id))
+                {
+                    group.name = name;
+                }
+            }
+            Renaming::Pane { pane, text } => {
+                // A blank name clears the session's name, so its automatic title comes back.
+                if let (true, Some(pane)) = (commit, self.pane_with_id(pane)) {
+                    let name = tab_groups::clean_name(&text);
+                    pane.update(cx, |view, cx| view.set_custom_title(name, cx));
+                }
+            }
+        }
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    /// Types into the rename editor. Enter commits, Escape cancels.
+    fn rename_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        // Shortcuts still reach the keymap, as in the palette.
+        if keystroke.modifiers.platform || keystroke.modifiers.control {
+            return;
+        }
+        match keystroke.key.as_str() {
+            "escape" => self.finish_rename(false, window, cx),
+            "enter" => self.finish_rename(true, window, cx),
+            key => {
+                if let Some(Renaming::Tab { text, .. } | Renaming::Group { text, .. } | Renaming::Pane { text, .. }) =
+                    self.renaming.as_mut()
+                {
+                    match key {
+                        "backspace" => {
+                            text.pop();
+                        }
+                        _ => {
+                            if let Some(typed) = &keystroke.key_char {
+                                text.extend(typed.chars().filter(|c| !c.is_control()));
+                            }
+                        }
+                    }
+                }
+                cx.notify();
+            }
+        }
+        cx.stop_propagation();
+    }
+
+    /// Adds a group named after its id. Returns the id.
+    fn create_group(&mut self) -> GroupId {
+        let id = self.next_group_id;
+        self.next_group_id += 1;
+        self.groups.push(Group {
+            id,
+            name: format!("Group {id}"),
+        });
+        id
+    }
+
+    /// Drops the tab at `from` into `group`, or onto the tab at `onto` (taking
+    /// its place and group). Follows `tab_groups::move_to_group`, and the
+    /// active tab stays selected.
+    fn drop_tab(&mut self, from: usize, group: Option<GroupId>, onto: Option<usize>, cx: &mut Context<Self>) {
+        if from >= self.tabs.len() {
+            return;
+        }
+        let to = tab_groups::move_to_group(&mut self.tabs, from, group, onto);
+        self.active_tab = tab_groups::follow(self.active_tab, from, to);
+        cx.notify();
+    }
+
+    /// While a sidebar row is dragged, the mouse is over `target`: a release
+    /// drops the row there. Does nothing when no row is dragged.
+    fn hover_drop(&mut self, target: SessionDrop, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.session_drag.is_none() || event.pressed_button != Some(MouseButton::Left) {
+            return;
+        }
+        if self.session_drop != Some(target) {
+            self.session_drop = Some(target);
+            cx.notify();
+        }
+    }
+
+    /// Ends a sidebar drag: the dragged row goes where the mouse last was.
+    fn finish_session_drag(&mut self, cx: &mut Context<Self>) {
+        let (Some(from), Some(target)) = (self.session_drag.take(), self.session_drop.take()) else {
+            return;
+        };
+        match target {
+            SessionDrop::Row(index) => self.drop_tab(from, None, Some(index), cx),
+            SessionDrop::Group(id) => self.drop_tab(from, Some(id), None, cx),
+            SessionDrop::NoGroup => self.drop_tab(from, None, None, cx),
+        }
+    }
+
+    /// Puts the tab at `index` in `group` (`None` for no group). Its place
+    /// follows `tab_groups::set_group`, and the tab stays the active one.
+    fn set_tab_group(&mut self, index: usize, group: Option<GroupId>, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        let to = tab_groups::set_group(&mut self.tabs, index, group);
+        self.active_tab = tab_groups::follow(self.active_tab, index, to);
+        cx.notify();
+    }
+
+    /// The group of the active tab, if it has one.
+    fn active_group(&self) -> Option<GroupId> {
+        self.tabs.get(self.active_tab)?.group
+    }
+
+    fn new_group_action(&mut self, _: &NewGroup, _: &mut Window, cx: &mut Context<Self>) {
+        let id = self.create_group();
+        self.set_tab_group(self.active_tab, Some(id), cx);
+    }
+
+    /// Renames the group of the active tab, in its sidebar header.
+    fn rename_group_action(&mut self, _: &RenameGroup, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.active_group() {
+            self.start_group_rename(id, window, cx);
+        }
+    }
+
+    /// Opens the rename editor on group `id`'s name, in its sidebar header.
+    fn start_group_rename(&mut self, id: GroupId, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(name) = self.groups.iter().find(|group| group.id == id).map(|group| group.name.clone()) {
+            self.reveal_sessions();
+            self.renaming = Some(Renaming::Group { id, text: name });
+            window.focus(&self.rename_focus, cx);
+            cx.notify();
+        }
+    }
+
+    /// Deletes the group of the active tab. Its tabs stay open, in no group.
+    fn delete_group_action(&mut self, _: &DeleteGroup, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.active_group() {
+            self.delete_group(id, cx);
+        }
+    }
+
+    fn delete_group(&mut self, id: GroupId, cx: &mut Context<Self>) {
+        if self.group_text(id).is_some() {
+            self.renaming = None;
+        }
+        self.groups.retain(|group| group.id != id);
+        tab_groups::remove_group(&mut self.tabs, id);
+        cx.notify();
+    }
+
+    /// Moves the active pane into tab `target`, beside that tab's active
+    /// pane, or into a tab of its own when `target` is `None`. The pane keeps
+    /// its shell. A tab it leaves with no panes is closed.
+    fn move_active_pane(&mut self, target: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pane) = self.active_pane() else {
+            return;
+        };
+        let Some(source) = self.tab_index_of(&pane) else {
+            return;
+        };
+        match target {
+            Some(index) => {
+                if index == source || index >= self.tabs.len() {
+                    return;
+                }
+                let tab = &mut self.tabs[index];
+                let beside = tab.active.clone();
+                if !tab.panes.split(&beside, Axis::Horizontal, pane.clone()) {
+                    return;
+                }
+                tab.active = pane.clone();
+                let removed = self.detach_pane(source, &pane);
+                // The target moves down one place when the tab before it is closed.
+                self.active_tab = if removed && source < index { index - 1 } else { index };
+            }
+            None => {
+                // A tab with one pane has nowhere to send it.
+                if self.tabs[source].panes.leaves().len() < 2 {
+                    return;
+                }
+                self.detach_pane(source, &pane);
+                self.tabs.push(Tab::new(SplitTree::new(pane.clone()), pane.clone()));
+                self.active_tab = self.tabs.len() - 1;
+            }
+        }
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    /// Takes `pane` out of tab `index`. The tab keeps its other panes, and its
+    /// active pane moves to the neighbour that takes the place. Returns `true`
+    /// when the tab had no other pane and was removed.
+    fn detach_pane(&mut self, index: usize, pane: &Entity<TerminalView>) -> bool {
+        let Tab {
+            panes,
+            active,
+            name,
+            group,
+            preview,
+        } = self.tabs.remove(index);
+        let position = panes.leaves().iter().position(|p| p == pane).unwrap_or(0);
+        match panes.remove(pane) {
+            Some(panes) => {
+                let after = panes.leaves();
+                let active = if active == *pane {
+                    after[position.min(after.len() - 1)].clone()
+                } else {
+                    active
+                };
+                self.tabs.insert(
+                    index,
+                    Tab {
+                        panes,
+                        active,
+                        name,
+                        group,
+                        preview,
+                    },
+                );
+                false
+            }
+            None => {
+                if self.active_tab > index {
+                    self.active_tab -= 1;
+                }
+                true
+            }
+        }
+    }
+
+    fn move_pane_to_new_tab(&mut self, _: &MovePaneToNewTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_active_pane(None, window, cx);
+    }
+
+    fn open_tab_picker(&mut self, _: &MovePaneToTab, window: &mut Window, cx: &mut Context<Self>) {
+        let rows: Vec<(String, Pick)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != self.active_tab)
+            .map(|(index, tab)| (tab.title(cx), Pick::Tab(index)))
+            .collect();
+        if !rows.is_empty() {
+            self.open_picker(rows, window, cx);
+        }
+    }
+
+    fn open_group_picker(&mut self, _: &MoveTabToGroup, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        let mut rows = vec![("No group".to_string(), Pick::Group(None))];
+        rows.extend(
+            self.groups
+                .iter()
+                .map(|group| (group.name.clone(), Pick::Group(Some(group.id)))),
+        );
+        rows.push(("New group".to_string(), Pick::NewGroup));
+        self.open_picker(rows, window, cx);
+    }
+
+    fn open_picker(&mut self, rows: Vec<(String, Pick)>, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker = Some(Picker { rows, selected: 0 });
+        window.focus(&self.palette_focus, cx);
+        cx.notify();
+    }
+
+    fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker = None;
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    /// Does what row `row` of the picker says, and closes it.
+    fn choose(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pick) = self
+            .picker
+            .take()
+            .and_then(|picker| picker.rows.get(row).map(|(_, pick)| *pick))
+        else {
+            return;
+        };
+        match pick {
+            Pick::Group(group) => self.set_tab_group(self.active_tab, group, cx),
+            Pick::NewGroup => {
+                let id = self.create_group();
+                self.set_tab_group(self.active_tab, Some(id), cx);
+            }
+            Pick::Tab(index) => self.move_active_pane(Some(index), window, cx),
+        }
+        self.focus_active(window, cx);
+    }
+
+    fn picker_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        if keystroke.modifiers.platform || keystroke.modifiers.control {
+            return;
+        }
+        match keystroke.key.as_str() {
+            "escape" => self.close_picker(window, cx),
+            "enter" => {
+                let row = self.picker.as_ref().map(|picker| picker.selected);
+                if let Some(row) = row {
+                    self.choose(row, window, cx);
+                }
+            }
+            "up" | "down" => {
+                if let Some(picker) = self.picker.as_mut() {
+                    let rows = picker.rows.len();
+                    picker.selected = if keystroke.key == "up" {
+                        (picker.selected + rows - 1) % rows
+                    } else {
+                        (picker.selected + 1) % rows
+                    };
+                }
+                cx.notify();
+            }
+            _ => {}
+        }
+        cx.stop_propagation();
+    }
+
+    /// The picker card, drawn where the palette is.
+    fn render_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(picker) = &self.picker else {
+            return div().into_any_element();
+        };
+        let chrome = &self.style.palette.chrome;
+        let rows = picker.rows.iter().enumerate().map(|(row, (label, _))| {
+            div()
+                .id(("picker-row", row))
+                .px_3()
+                .py_1p5()
+                .rounded(px(6.))
+                .text_size(px(13.))
+                .text_color(chrome.text)
+                .when(row == picker.selected, |d| d.bg(chrome.selected))
+                .child(label.clone())
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |ws, _: &MouseDownEvent, window, cx| ws.choose(row, window, cx)),
+                )
+        });
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .justify_center()
+            .pt(px(PALETTE_TOP))
+            .bg(gpui::black().opacity(0.3))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|ws, _: &MouseDownEvent, window, cx| ws.close_picker(window, cx)),
+            )
+            .child(
+                div()
+                    .id("picker")
+                    .track_focus(&self.palette_focus)
+                    .on_key_down(cx.listener(Self::picker_key))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .flex()
+                    .flex_col()
+                    .w(px(PALETTE_WIDTH))
+                    .p_1p5()
+                    .bg(chrome.overlay)
+                    .border_1()
+                    .border_color(chrome.divider)
+                    .rounded(px(10.))
+                    .shadow_lg()
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+
+    /// Shows `path` in a panel beside the panes of tab `index`, replacing the
+    /// file open there. The keyboard stays where it is.
+    fn open_preview(&mut self, index: usize, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        let style = self.style.clone();
+        let viewer = cx.new(|cx| FileViewer::new(path, style, cx));
+        let close = cx.subscribe_in(&viewer, window, Self::on_preview_event);
+        self.tabs[index].preview = Some(Preview {
+            viewer,
+            _close: close,
+        });
+        cx.notify();
+    }
+
+    fn on_preview_event(
+        &mut self,
+        viewer: &Entity<FileViewer>,
+        event: &FileViewerEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            FileViewerEvent::Close => {
+                let closed = self
+                    .tabs
+                    .iter_mut()
+                    .find(|tab| tab.preview.as_ref().is_some_and(|p| p.viewer == *viewer))
+                    .map(|tab| tab.preview = None)
+                    .is_some();
+                if closed {
+                    self.focus_active(window, cx);
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    fn close_preview(&mut self, _: &ClosePreview, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab).filter(|tab| tab.preview.is_some()) {
+            tab.preview = None;
+            self.focus_active(window, cx);
+            cx.notify();
+        }
+    }
+
     /// Removes a pane. Its tab closes with its last pane, and the window closes
     /// with its last tab.
     fn close_pane(&mut self, pane: &Entity<TerminalView>, window: &mut Window, cx: &mut Context<Self>) {
@@ -267,7 +875,13 @@ impl Workspace {
             return;
         };
         self.pane_subscriptions.remove(&pane.entity_id());
-        let Tab { panes, active } = self.tabs.remove(index);
+        let Tab {
+            panes,
+            active,
+            name,
+            group,
+            preview,
+        } = self.tabs.remove(index);
         let before = panes.leaves();
         let position = before.iter().position(|p| p == pane).unwrap_or(0);
         match panes.remove(pane) {
@@ -279,7 +893,16 @@ impl Workspace {
                 } else {
                     active
                 };
-                self.tabs.insert(index, Tab { panes, active });
+                self.tabs.insert(
+                    index,
+                    Tab {
+                        panes,
+                        active,
+                        name,
+                        group,
+                        preview,
+                    },
+                );
             }
             None if self.active_tab > index => self.active_tab -= 1,
             None => {}
@@ -311,6 +934,8 @@ impl Workspace {
     }
 
     fn select_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // Selecting another tab ends a rename in progress, keeping what was typed.
+        self.finish_rename(true, window, cx);
         if index < self.tabs.len() {
             self.active_tab = index;
             self.focus_active(window, cx);
@@ -511,10 +1136,20 @@ impl Workspace {
                         .iter()
                         .position(|pane| *pane == tab.active)
                         .unwrap_or(0),
+                    name: tab.name.clone(),
+                    group: tab.group,
                 })
                 .collect(),
             active_tab: self.active_tab,
             sidebar_width: Some(self.sidebar.width),
+            groups: self
+                .groups
+                .iter()
+                .map(|group| SavedGroup {
+                    id: group.id,
+                    name: group.name.clone(),
+                })
+                .collect(),
         }
     }
 
@@ -527,6 +1162,14 @@ impl Workspace {
         if saved.tabs.is_empty() {
             return false;
         }
+        let groups: Vec<Group> = saved
+            .groups
+            .iter()
+            .map(|group| Group {
+                id: group.id,
+                name: group.name.clone(),
+            })
+            .collect();
         let mut tabs = Vec::new();
         for saved_tab in &saved.tabs {
             match self.restore_node(&saved_tab.root, window, cx) {
@@ -534,7 +1177,13 @@ impl Workspace {
                     let panes = SplitTree::from_root(root);
                     let leaves = panes.leaves();
                     let active = leaves[saved_tab.active.min(leaves.len() - 1)].clone();
-                    tabs.push(Tab { panes, active });
+                    let mut tab = Tab::new(panes, active);
+                    tab.name = saved_tab.name.clone();
+                    // A group that is not in the saved list is dropped, so no tab points at nothing.
+                    tab.group = saved_tab
+                        .group
+                        .filter(|id| groups.iter().any(|group| group.id == *id));
+                    tabs.push(tab);
                 }
                 Err(e) => {
                     // Nothing is kept from a partial restore. Dropping the tabs drops their shells.
@@ -545,6 +1194,8 @@ impl Workspace {
             }
         }
         self.tabs = tabs;
+        self.next_group_id = groups.iter().map(|group| group.id).max().unwrap_or(0) + 1;
+        self.groups = groups;
         self.active_tab = saved.active_tab.min(self.tabs.len() - 1);
         if let Some(width) = saved.sidebar_width {
             self.sidebar.width = sidebar::clamp_width(width);
@@ -560,8 +1211,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Result<Node<Entity<TerminalView>>, String> {
         match node {
-            SavedNode::Pane { cwd } => {
+            SavedNode::Pane { cwd, name } => {
                 let pane = self.add_pane(cwd.as_deref(), window, cx)?;
+                if name.is_some() {
+                    pane.update(cx, |view, cx| view.set_custom_title(name.clone(), cx));
+                }
                 Ok(Node::Leaf(pane))
             }
             SavedNode::Split {
@@ -807,106 +1461,16 @@ impl Workspace {
         self.set_font_size(cx);
     }
 
-    /// The title bar: the sidebar toggle, then the tabs and the new-tab button.
-    /// With the Sessions list open the tabs are in the sidebar, so the bar shows
-    /// the active title instead. Its empty space drags the window, and a double
-    /// click zooms it. The tabs and buttons stop their mouse-downs, so clicking
-    /// them never drags.
-    fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The title bar: the sidebar toggle and the active session's title. The
+    /// sessions themselves are listed in the sidebar. Its empty space drags the
+    /// window, and a double click zooms it.
+    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let chrome = &self.style.palette.chrome;
-        let sessions_open = self.sidebar.open && self.sidebar.mode == Mode::Sessions;
-        let toggle = self.render_sidebar_toggle(cx);
         let title = self
             .tabs
             .get(self.active_tab)
-            .map(|tab| tab.active.read(cx).tab_title())
+            .map(|tab| tab.title(cx))
             .unwrap_or_default();
-        let tabs = self.tabs.iter().enumerate().map(|(index, tab)| {
-            let active = index == self.active_tab;
-            let title = tab.active.read(cx).tab_title();
-            // Each tab is its own group, so its close button shows only while that tab is hovered.
-            let group = format!("tab-{index}");
-            div()
-                .id(("tab", index))
-                .group(group.clone())
-                .flex()
-                .items_center()
-                .h(px(TAB_HEIGHT))
-                .px_3()
-                .min_w(px(90.))
-                .max_w(px(200.))
-                .rounded(px(6.))
-                .overflow_hidden()
-                .text_size(px(13.))
-                .bg(if active { chrome.tab_active } else { chrome.tab_bar })
-                .text_color(if active { chrome.text } else { chrome.muted })
-                .when(!active, |d| {
-                    d.hover(|d| d.bg(chrome.tab_hover).text_color(chrome.text))
-                })
-                .child(
-                    // A terminal glyph in the terminal font, marking the tab as a shell.
-                    div()
-                        .flex_shrink_0()
-                        .mr_1p5()
-                        .font_family(self.style.font_family.clone())
-                        .text_size(px(11.))
-                        .text_color(if active { chrome.accent } else { chrome.muted })
-                        .child(">_"),
-                )
-                .child(
-                    // The title shrinks and ends in an ellipsis before the close button.
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(title),
-                )
-                .child(
-                    div()
-                        .id(("tab-close", index))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .flex_shrink_0()
-                        .ml_1()
-                        .size(px(16.))
-                        .rounded(px(4.))
-                        .cursor_pointer()
-                        // Inactive tabs show their close button only when hovered.
-                        .text_color(if active {
-                            chrome.muted
-                        } else {
-                            gpui::transparent_black()
-                        })
-                        .group_hover(group, |style| style.text_color(chrome.muted))
-                        .hover(|d| d.bg(chrome.close_hover).text_color(chrome.text))
-                        .child("×")
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |ws, _: &MouseDownEvent, window, cx| {
-                                // The click must not reach the tab, or it would select the tab first.
-                                cx.stop_propagation();
-                                ws.close_tab(index, window, cx);
-                            }),
-                        ),
-                )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |ws, _: &MouseDownEvent, window, cx| {
-                        // Stops here so the title bar does not start a window drag.
-                        cx.stop_propagation();
-                        ws.select_tab(index, window, cx)
-                    }),
-                )
-                .on_mouse_down(
-                    MouseButton::Middle,
-                    cx.listener(move |ws, _: &MouseDownEvent, window, cx| {
-                        ws.close_tab(index, window, cx)
-                    }),
-                )
-        });
         div()
             .flex()
             .flex_row()
@@ -928,44 +1492,105 @@ impl Workspace {
                     window.start_window_move();
                 }
             })
-            .child(toggle)
-            .when(sessions_open, |bar| {
-                bar.child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_center()
-                        .text_size(px(12.))
-                        .text_color(chrome.muted)
-                        .child(title),
-                )
-            })
-            .when(!sessions_open, |bar| {
-                bar.children(tabs).child(
-                    div()
-                        .id("new-tab")
-                        .flex()
-                        .flex_shrink_0()
-                        .items_center()
-                        .justify_center()
-                        .size(px(24.))
-                        .rounded(px(6.))
-                        .cursor_pointer()
-                        .text_color(chrome.muted)
-                        .hover(|d| d.bg(chrome.tab_hover).text_color(chrome.text))
-                        .child("+")
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|ws, _: &MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                ws.new_tab(&NewTab, window, cx)
-                            }),
-                        ),
-                )
-            })
+            .child(self.render_sidebar_toggle(cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_center()
+                    .text_size(px(12.))
+                    .text_color(chrome.muted)
+                    .child(title),
+            )
+            // Balances the toggle, so the title sits in the middle of the window.
+            .child(div().flex_shrink_0().w(px(30.)))
+    }
+
+    /// A group's name. Clicking it starts a rename; while renaming it is the editor.
+    fn group_label(&self, id: GroupId, cx: &mut Context<Self>) -> AnyElement {
+        let chrome = &self.style.palette.chrome;
+        if let Some(text) = self.group_text(id) {
+            return self.rename_editor(("group-rename", id), text, cx);
+        }
+        let name = self
+            .groups
+            .iter()
+            .find(|group| group.id == id)
+            .map(|group| group.name.clone())
+            .unwrap_or_default();
+        div()
+            .id(("group-name", id))
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_ellipsis()
+            .text_color(chrome.text)
+            .child(name)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |ws, _: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    ws.start_group_rename(id, window, cx);
+                }),
+            )
+            .into_any_element()
+    }
+
+    /// The × that deletes a group. Its tabs stay open, in no group.
+    fn group_delete_button(&self, id: GroupId, cx: &mut Context<Self>) -> AnyElement {
+        let chrome = &self.style.palette.chrome;
+        div()
+            .id(("group-delete", id))
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .justify_center()
+            .size(px(14.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .text_color(chrome.muted)
+            .hover(|d| d.bg(chrome.close_hover).text_color(chrome.text))
+            .child("×")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |ws, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    ws.delete_group(id, cx);
+                }),
+            )
+            .into_any_element()
+    }
+
+    /// The name being typed for group `id`, if that group is being renamed.
+    fn group_text(&self, id: GroupId) -> Option<String> {
+        match &self.renaming {
+            Some(Renaming::Group { id: editing, text }) if *editing == id => Some(text.clone()),
+            _ => None,
+        }
+    }
+
+    /// The inline editor that stands in for a name while it is typed. It keeps
+    /// the mouse, so a click in it does not select the tab or start a drag.
+    fn rename_editor(&self, id: impl Into<ElementId>, text: String, cx: &Context<Self>) -> AnyElement {
+        let chrome = &self.style.palette.chrome;
+        div()
+            .id(id)
+            .track_focus(&self.rename_focus)
+            .on_key_down(cx.listener(Self::rename_key))
+            .flex()
+            .flex_1()
+            .items_center()
+            .min_w_0()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .child(text)
+            .child(caret(chrome))
+            .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| cx.stop_propagation())
+            .into_any_element()
     }
 
     /// The sidebar toggle in the title bar. Drawn with divs: a small box with a
@@ -1020,6 +1645,12 @@ impl Workspace {
             .min_h_0()
             .min_w_0()
             .relative()
+            // A session dragged out of the sidebar over the panes has no drop target, so a release cancels it.
+            .on_mouse_move(cx.listener(|ws, _: &MouseMoveEvent, _, cx| {
+                if ws.session_drop.take().is_some() {
+                    cx.notify();
+                }
+            }))
             .child(
                 canvas(
                     move |bounds, _, _| area.set(bounds),
@@ -1031,7 +1662,33 @@ impl Workspace {
         if let Some(tab) = self.tabs.get(self.active_tab) {
             content = content.child(self.render_node(tab.panes.root(), Vec::new(), cx));
         }
-        content
+        // With a file open, the panes take the left half and the file the right.
+        let Some(preview) = self.tabs.get(self.active_tab).and_then(|tab| tab.preview.as_ref()) else {
+            return content.into_any_element();
+        };
+        div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .child(content)
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .w(px(1.))
+                    .h_full()
+                    .bg(self.style.palette.chrome.divider),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .h_full()
+                    .child(preview.viewer.clone()),
+            )
+            .into_any_element()
     }
 
     /// Renders one node of the split tree with flexbox. The sizes match
@@ -1235,6 +1892,9 @@ impl Workspace {
                 self.tabs.push(Tab {
                     panes: SplitTree::new(pane.clone()),
                     active: pane,
+                    name: None,
+                    group: None,
+                    preview: None,
                 });
                 self.active_tab = self.tabs.len() - 1;
                 self.focus_active(window, cx);
@@ -1351,164 +2011,240 @@ impl Workspace {
                             }),
                         ),
                 )
+                .child(
+                    // New group: takes the active session into a new group and names it.
+                    div()
+                        .id("sidebar-new-group")
+                        .flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .justify_center()
+                        .size(px(24.))
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        .text_color(muted)
+                        .hover(|d| d.bg(chrome.tab_hover).text_color(text))
+                        .child("⊞")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|ws, _: &MouseDownEvent, window, cx| {
+                                ws.new_group_action(&NewGroup, window, cx);
+                                if let Some(id) = ws.active_group() {
+                                    ws.start_group_rename(id, window, cx);
+                                }
+                            }),
+                        ),
+                )
             });
 
         let body: Vec<AnyElement> = match mode {
-            Mode::Sessions => self
-                .tabs
-                .iter()
-                .enumerate()
-                .map(|(index, tab)| {
-                    let active = index == self.active_tab;
-                    let pane = tab.active.read(cx);
-                    let title = pane.tab_title();
-                    let running = pane.is_running();
-                    let branch = pane.branch();
-                    // The directory's name, or its full path when that name is the title.
-                    let dir = match pane.cwd() {
-                        Some(dir) if dir_label(&dir) == title => display_dir(&dir),
-                        Some(dir) => dir_label(&dir),
-                        None => String::new(),
-                    };
-                    // Yellow while a command runs, the accent on the active row, muted otherwise.
-                    let badge_text = if running {
-                        self.style.palette.resolve(Color::Named(NamedColor::Yellow))
-                    } else if active {
-                        chrome.accent
-                    } else {
-                        muted
-                    };
-                    // Each row is its own group, so its close button shows only while that row is hovered.
-                    let group = format!("session-{index}");
-                    div()
-                        .id(("session", index))
-                        .group(group.clone())
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .w_full()
-                        .px(px(8.))
-                        .py(px(6.))
-                        .mb(px(2.))
-                        .rounded(px(6.))
-                        .cursor_pointer()
-                        .when(active, |row| row.bg(chrome.tab_active))
-                        .hover(|row| row.bg(chrome.tab_hover))
-                        .child(
-                            // A terminal glyph in the terminal font, marking the session as a shell.
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .flex_shrink_0()
-                                .size(px(22.))
-                                .rounded(px(5.))
-                                .bg(if active { chrome.surface } else { chrome.tab_active })
-                                .font_family(self.style.font_family.clone())
-                                .text_size(px(9.))
-                                .text_color(badge_text)
-                                .child(">_"),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .flex_col()
-                                .child(
+            Mode::Sessions => {
+                let rows: Vec<(Option<GroupId>, AnyElement)> = self
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, tab)| {
+                        let active = index == self.active_tab;
+                        let pane = tab.active.read(cx);
+                        let title = tab.title(cx);
+                        // The name being typed, when this session (or its active pane) is being renamed.
+                        let renaming = match &self.renaming {
+                            Some(Renaming::Tab { index: editing, text }) if *editing == index => Some(text.clone()),
+                            Some(Renaming::Pane { pane, text }) if *pane == tab.active.entity_id() => Some(text.clone()),
+                            _ => None,
+                        };
+                        let running = pane.is_running();
+                        let branch = pane.branch();
+                        // The directory's name, or its full path when that name is the title.
+                        let dir = match pane.cwd() {
+                            Some(dir) if dir_label(&dir) == title => display_dir(&dir),
+                            Some(dir) => dir_label(&dir),
+                            None => String::new(),
+                        };
+                        // Yellow while a command runs, the accent on the active row, muted otherwise.
+                        let badge_text = if running {
+                            self.style.palette.resolve(Color::Named(NamedColor::Yellow))
+                        } else if active {
+                            chrome.accent
+                        } else {
+                            muted
+                        };
+                        // `Some(true)` draws the drop line below this row, `Some(false)` above it.
+                        let drop_line = match (self.session_drag, self.session_drop) {
+                            (Some(from), Some(SessionDrop::Row(target))) if target == index && from != index => {
+                                Some(index > from)
+                            }
+                            _ => None,
+                        };
+                        // Each row is its own group, so its close button shows only while that row is hovered.
+                        let group = format!("session-{index}");
+                        let row = div()
+                            .id(("session", index))
+                            .group(group.clone())
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .w_full()
+                            .px(px(8.))
+                            .py(px(6.))
+                            .mb(px(2.))
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .relative()
+                            .when(active, |row| row.bg(chrome.tab_active))
+                            .hover(|row| row.bg(chrome.tab_hover))
+                            // The row a drag would land on shows an accent line on the side it lands:
+                            // below it when the dragged row comes from above, above it otherwise.
+                            .when_some(drop_line, |row, below| {
+                                row.child(
                                     div()
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_ellipsis()
-                                        .text_size(px(12.))
-                                        .text_color(text)
-                                        .child(title),
+                                        .absolute()
+                                        .left_0()
+                                        .right_0()
+                                        .h(px(2.))
+                                        .rounded(px(1.))
+                                        .bg(chrome.accent)
+                                        .when(below, |line| line.bottom(px(-2.)))
+                                        .when(!below, |line| line.top(px(-2.))),
                                 )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .min_w_0()
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_size(px(10.5))
-                                        .text_color(muted)
-                                        .child(
-                                            div()
-                                                .min_w_0()
-                                                .overflow_hidden()
-                                                .text_ellipsis()
-                                                .child(dir),
-                                        )
-                                        .when_some(branch, |line, branch| {
-                                            line.child(
-                                                div()
-                                                    .flex_shrink_0()
-                                                    .text_color(chrome.success)
-                                                    .child(format!(" · {branch}")),
-                                            )
-                                        })
-                                        .when(running, |line| {
-                                            line.child(div().flex_shrink_0().child(" · running"))
-                                        }),
-                                ),
-                        )
-                        .child(
-                            // The shortcut for tabs 1 to 9. On hover the close button takes its place.
-                            div()
-                                .relative()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .flex_shrink_0()
-                                .size(px(16.))
-                                .when(index < 9, |slot| {
-                                    slot.child(
+                            })
+                            .child(
+                                // A terminal glyph in the terminal font, marking the session as a shell.
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .flex_shrink_0()
+                                    .size(px(22.))
+                                    .rounded(px(5.))
+                                    .bg(if active { chrome.surface } else { chrome.tab_active })
+                                    .font_family(self.style.font_family.clone())
+                                    .text_size(px(9.))
+                                    .text_color(badge_text)
+                                    .child(">_"),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .child(match renaming {
+                                        Some(name) => div()
+                                            .flex()
+                                            .text_size(px(12.))
+                                            .text_color(text)
+                                            .child(self.rename_editor(("session-rename", index), name, cx))
+                                            .into_any_element(),
+                                        None => div()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .text_size(px(12.))
+                                            .text_color(text)
+                                            .child(title)
+                                            .into_any_element(),
+                                    })
+                                    .child(
                                         div()
+                                            .flex()
+                                            .flex_row()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
                                             .text_size(px(10.5))
                                             .text_color(muted)
-                                            .opacity(0.7)
-                                            .group_hover(group.clone(), |hint| hint.invisible())
-                                            .child(format!("⌘{}", index + 1)),
-                                    )
-                                })
-                                .child(
-                                    div()
-                                        .id(("session-close", index))
-                                        .absolute()
-                                        .top_0()
-                                        .left_0()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .size(px(16.))
-                                        .rounded(px(4.))
-                                        .cursor_pointer()
-                                        .text_color(muted)
-                                        .invisible()
-                                        .group_hover(group, |button| button.visible())
-                                        .hover(|button| button.bg(close_hover).text_color(text))
-                                        .child("×")
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |ws, _: &MouseDownEvent, window, cx| {
-                                                // The click must not reach the row, or it would select the tab first.
-                                                cx.stop_propagation();
-                                                ws.close_tab(index, window, cx);
+                                            .child(
+                                                div()
+                                                    .min_w_0()
+                                                    .overflow_hidden()
+                                                    .text_ellipsis()
+                                                    .child(dir),
+                                            )
+                                            .when_some(branch, |line, branch| {
+                                                line.child(
+                                                    div()
+                                                        .flex_shrink_0()
+                                                        .text_color(chrome.success)
+                                                        .child(format!(" · {branch}")),
+                                                )
+                                            })
+                                            .when(running, |line| {
+                                                line.child(div().flex_shrink_0().child(" · running"))
                                             }),
-                                        ),
-                                ),
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |ws, _: &MouseDownEvent, window, cx| {
-                                ws.select_tab(index, window, cx)
-                            }),
-                        )
-                        .into_any_element()
-                })
-                .collect(),
+                                    ),
+                            )
+                            .child(
+                                // The shortcut for tabs 1 to 9. On hover the close button takes its place.
+                                div()
+                                    .relative()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .flex_shrink_0()
+                                    .size(px(16.))
+                                    .when(index < 9, |slot| {
+                                        slot.child(
+                                            div()
+                                                .text_size(px(10.5))
+                                                .text_color(muted)
+                                                .opacity(0.7)
+                                                .group_hover(group.clone(), |hint| hint.invisible())
+                                                .child(format!("⌘{}", index + 1)),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .id(("session-close", index))
+                                            .absolute()
+                                            .top_0()
+                                            .left_0()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .size(px(16.))
+                                            .rounded(px(4.))
+                                            .cursor_pointer()
+                                            .text_color(muted)
+                                            .invisible()
+                                            .group_hover(group, |button| button.visible())
+                                            .hover(|button| button.bg(close_hover).text_color(text))
+                                            .child("×")
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |ws, _: &MouseDownEvent, window, cx| {
+                                                    // The click must not reach the row, or it would select the tab first.
+                                                    cx.stop_propagation();
+                                                    ws.close_tab(index, window, cx);
+                                                }),
+                                            ),
+                                    ),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |ws, event: &MouseDownEvent, window, cx| {
+                                    ws.session_drag = Some(index);
+                                    ws.session_drop = None;
+                                    ws.select_tab(index, window, cx);
+                                    // A double click renames the session.
+                                    if event.click_count == 2 {
+                                        ws.session_drag = None;
+                                        ws.rename_tab_action(&RenameTab, window, cx);
+                                    }
+                                }),
+                            )
+                            // Dragged over, this row becomes the drop target. The drop happens on release, anywhere.
+                            .on_mouse_move(cx.listener(move |ws, event: &MouseMoveEvent, _, cx| {
+                                ws.hover_drop(SessionDrop::Row(index), event, cx);
+                            }))
+                            .into_any_element();
+                        (tab.group, row)
+                    })
+                    .collect();
+                self.sidebar_sessions(rows, cx)
+            }
             Mode::Files => self
                 .sidebar
                 .tree
@@ -1555,10 +2291,13 @@ impl Workspace {
                         )
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |ws, _: &MouseDownEvent, window, cx| {
+                            cx.listener(move |ws, event: &MouseDownEvent, window, cx| {
                                 if is_dir {
                                     ws.sidebar.tree.toggle(&path);
                                     cx.notify();
+                                } else if event.modifiers.secondary() {
+                                    let index = ws.active_tab;
+                                    ws.open_preview(index, path.clone(), window, cx);
                                 } else {
                                     ws.insert_path(&path, window, cx);
                                 }
@@ -1670,6 +2409,91 @@ impl Workspace {
             .border_color(divider)
             .child(panel)
             .child(handle)
+    }
+
+    /// The Sessions list in sections. Tabs in no group come first, in tab order.
+    /// Then each group, with its header and its tabs. Empty groups show their header.
+    fn sidebar_sessions(
+        &self,
+        rows: Vec<(Option<GroupId>, AnyElement)>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let (ungrouped, mut pending): (Vec<_>, Vec<_>) =
+            rows.into_iter().partition(|(group, _)| group.is_none());
+        let mut body: Vec<AnyElement> = ungrouped.into_iter().map(|(_, row)| row).collect();
+        for group in &self.groups {
+            let (mine, rest): (Vec<_>, Vec<_>) = pending
+                .into_iter()
+                .partition(|(in_group, _)| *in_group == Some(group.id));
+            pending = rest;
+            body.push(self.render_group_header(group.id, cx));
+            body.extend(mine.into_iter().map(|(_, row)| row));
+        }
+        body.extend(pending.into_iter().map(|(_, row)| row));
+        body.push(self.render_no_group_zone(cx));
+        body
+    }
+
+    /// The space below the Sessions list. Dragging a session in a group over
+    /// it shows "Drop to leave the group", and a drop there takes it out. So a
+    /// session can leave a group even when every session is in one.
+    fn render_no_group_zone(&self, cx: &mut Context<Self>) -> AnyElement {
+        let chrome = &self.style.palette.chrome;
+        let grouped_drag = self
+            .session_drag
+            .and_then(|from| self.tabs.get(from))
+            .is_some_and(|tab| tab.group.is_some());
+        let target = self.session_drop == Some(SessionDrop::NoGroup);
+        div()
+            .id("sidebar-no-group")
+            .flex()
+            .items_center()
+            .justify_center()
+            .w_full()
+            .h(px(64.))
+            .mt(px(6.))
+            .rounded(px(6.))
+            .text_size(px(11.))
+            .text_color(chrome.muted)
+            .when(grouped_drag, |zone| {
+                zone.border_1()
+                    .border_dashed()
+                    .border_color(if target { chrome.accent } else { chrome.divider })
+                    .when(target, |zone| zone.bg(chrome.accent.opacity(0.15)).text_color(chrome.text))
+                    .child("Drop to leave the group")
+            })
+            .on_mouse_move(cx.listener(|ws, event: &MouseMoveEvent, _, cx| {
+                ws.hover_drop(SessionDrop::NoGroup, event, cx);
+            }))
+            .into_any_element()
+    }
+
+    /// A group's header in the sidebar: its name, and a × that deletes the group.
+    fn render_group_header(&self, id: GroupId, cx: &mut Context<Self>) -> AnyElement {
+        let accent = self.style.palette.chrome.accent;
+        let target = self.session_drop == Some(SessionDrop::Group(id));
+        div()
+            .id(("sidebar-group", id))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .w_full()
+            .h(px(22.))
+            .mt(px(6.))
+            .mb(px(2.))
+            .px(px(8.))
+            .rounded(px(4.))
+            .text_size(px(11.))
+            .text_color(self.style.palette.chrome.muted)
+            // The header a drag would land on is tinted: a drop joins the group.
+            .when(target, |header| header.bg(accent.opacity(0.15)))
+            .child(self.group_label(id, cx))
+            .child(self.group_delete_button(id, cx))
+            .on_mouse_move(cx.listener(move |ws, event: &MouseMoveEvent, _, cx| {
+                ws.hover_drop(SessionDrop::Group(id), event, cx);
+            }))
+            .into_any_element()
     }
 
     /// One segment of the sidebar's switch. The active one is raised.
@@ -1839,6 +2663,15 @@ impl Render for Workspace {
             self.shown_appearance = Some(self.appearance);
         }
         self.sync_file_tree(cx);
+        if let Some(viewer) = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.preview.as_ref())
+            .map(|preview| preview.viewer.clone())
+        {
+            let style = self.style.clone();
+            viewer.update(cx, |viewer, cx| viewer.set_style(style, cx));
+        }
         // While the panel is open it keeps the keyboard, so Escape reaches it.
         if self.settings_open && !self.settings_focus.is_focused(window) {
             window.focus(&self.settings_focus, cx);
@@ -1860,9 +2693,10 @@ impl Render for Workspace {
             .on_mouse_move(cx.listener(Self::drag_sidebar))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|ws, _: &MouseUpEvent, _, _| {
+                cx.listener(|ws, _: &MouseUpEvent, _, cx| {
                     ws.divider_drag = None;
                     ws.sidebar_drag = false;
+                    ws.finish_session_drag(cx);
                 }),
             )
             .on_action(cx.listener(Self::toggle_sidebar))
@@ -1873,6 +2707,16 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::new_tab))
             .on_action(cx.listener(Self::close_tab_action))
             .on_action(cx.listener(Self::close_pane_action))
+            .on_action(cx.listener(Self::rename_tab_action))
+            .on_action(cx.listener(Self::rename_pane_action))
+            .on_action(cx.listener(Self::move_tab_left))
+            .on_action(cx.listener(Self::move_tab_right))
+            .on_action(cx.listener(Self::new_group_action))
+            .on_action(cx.listener(Self::rename_group_action))
+            .on_action(cx.listener(Self::delete_group_action))
+            .on_action(cx.listener(Self::open_group_picker))
+            .on_action(cx.listener(Self::move_pane_to_new_tab))
+            .on_action(cx.listener(Self::open_tab_picker))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::previous_tab))
             .on_action(cx.listener(Self::select_tab_action))
@@ -1886,8 +2730,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::zoom_reset))
-            // The tab bar is the window's title bar, so it is always there.
-            .child(self.render_tab_bar(cx))
+            .on_action(cx.listener(Self::close_preview))
+            // The title bar is always there. Sessions are in the sidebar.
+            .child(self.render_title_bar(cx))
             .child(body);
         if let Some(error) = &self.error {
             root = root.child(
@@ -1905,6 +2750,9 @@ impl Render for Workspace {
         }
         if self.palette.is_some() {
             root = root.child(self.render_palette(cx));
+        }
+        if self.picker.is_some() {
+            root = root.child(self.render_picker(cx));
         }
         if self.settings_open {
             root = root.child(self.render_settings(cx));
@@ -1925,6 +2773,7 @@ fn compile(files: &Files, cx: &App) -> Result<Applied, String> {
             font_family: font_family.into(),
             font_size: px(settings.config.font.size),
             option_as_meta: settings.config.option_as_meta,
+            clipboard_write: settings.config.terminal.clipboard_write,
         },
         base_font_size: settings.config.font.size,
         bindings,
@@ -1991,6 +2840,7 @@ fn save_node(node: &Node<Entity<TerminalView>>, cx: &App) -> SavedNode {
     match node {
         Node::Leaf(pane) => SavedNode::Pane {
             cwd: pane.read(cx).cwd(),
+            name: pane.read(cx).custom_title().map(str::to_string),
         },
         Node::Split {
             axis,

@@ -1,9 +1,25 @@
 //! The text buffer. Positions are char indices into `text`, so multi-byte
 //! characters (accents, emoji) move as one step.
 
+use std::ops::Range;
+
 /// A word is letters, digits and underscore. Everything else separates words.
 fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+/// The kind of char a double click selects as one run: words, spaces, line
+/// breaks and punctuation each form their own run.
+fn run_class(c: char) -> u8 {
+    if is_word(c) {
+        0
+    } else if c == '\n' {
+        1
+    } else if c.is_whitespace() {
+        2
+    } else {
+        3
+    }
 }
 
 /// What the last edit was, so typing a word is one undo step.
@@ -27,6 +43,9 @@ struct Snapshot {
 pub struct Buffer {
     text: Vec<char>,
     cursor: usize,
+    /// The other end of the selection. The selection runs from here to the
+    /// cursor, and is `None` when they are the same char.
+    anchor: Option<usize>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     last: Option<Last>,
@@ -87,6 +106,60 @@ impl Buffer {
         self.cursor = index.min(self.text.len());
     }
 
+    /// The selected char indices, or `None` without a selection.
+    pub fn selection(&self) -> Option<Range<usize>> {
+        let anchor = self.anchor?;
+        Some(anchor.min(self.cursor)..anchor.max(self.cursor))
+    }
+
+    /// The selected text, or `None` without a selection.
+    pub fn selected_text(&self) -> Option<String> {
+        self.selection()
+            .map(|range| self.text[range].iter().collect())
+    }
+
+    /// Runs a cursor motion and keeps the text it crosses selected. Shift+arrows
+    /// use this. The selection starts where the cursor was before the first one.
+    pub fn extend_selection(&mut self, motion: impl FnOnce(&mut Buffer)) {
+        let anchor = self.anchor.unwrap_or(self.cursor);
+        motion(self);
+        self.anchor = (self.cursor != anchor).then_some(anchor);
+    }
+
+    /// Selects the run of chars under `index`: a word, a run of spaces, or a
+    /// run of punctuation. A double click does this. The cursor goes to its end.
+    pub fn select_word_at(&mut self, index: usize) {
+        if self.text.is_empty() {
+            return;
+        }
+        // At the end of the text, the char before the index is the one clicked.
+        let probe = index.min(self.text.len() - 1);
+        let class = run_class(self.text[probe]);
+        let mut start = probe;
+        while start > 0 && run_class(self.text[start - 1]) == class {
+            start -= 1;
+        }
+        let mut end = probe + 1;
+        while end < self.text.len() && run_class(self.text[end]) == class {
+            end += 1;
+        }
+        self.moved();
+        self.anchor = Some(start);
+        self.cursor = end;
+    }
+
+    /// Moves the cursor to the start of the text (Cmd+Up, when extending).
+    pub fn buffer_start(&mut self) {
+        self.moved();
+        self.cursor = 0;
+    }
+
+    /// Moves the cursor to the end of the text (Cmd+Down, when extending).
+    pub fn buffer_end(&mut self) {
+        self.moved();
+        self.cursor = self.text.len();
+    }
+
     /// The text before the cursor. Completion looks at this.
     pub fn before_cursor(&self) -> String {
         self.text[..self.cursor].iter().collect()
@@ -141,8 +214,11 @@ impl Buffer {
         }
     }
 
-    /// Deletes the character before the cursor.
+    /// Deletes the character before the cursor, or the selection.
     pub fn backspace(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if self.cursor == 0 {
             return;
         }
@@ -151,8 +227,11 @@ impl Buffer {
         self.text.remove(self.cursor);
     }
 
-    /// Deletes the character after the cursor.
+    /// Deletes the character after the cursor, or the selection.
     pub fn delete_forward(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if self.cursor == self.text.len() {
             return;
         }
@@ -162,6 +241,9 @@ impl Buffer {
 
     /// Deletes back to the start of the previous word (Option+Backspace).
     pub fn delete_word_back(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let start = self.word_back_target();
         if start == self.cursor {
             return;
@@ -173,6 +255,9 @@ impl Buffer {
 
     /// Deletes from the start of the line to the cursor (Cmd+Backspace).
     pub fn delete_to_line_start(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let start = self.line_start_index();
         if start == self.cursor {
             return;
@@ -256,6 +341,7 @@ impl Buffer {
         let text = self.text();
         self.text.clear();
         self.cursor = 0;
+        self.anchor = None;
         self.undo.clear();
         self.redo.clear();
         self.last = None;
@@ -292,23 +378,42 @@ impl Buffer {
     fn restore(&mut self, snapshot: Snapshot) {
         self.text = snapshot.text;
         self.cursor = snapshot.cursor;
+        self.anchor = None;
         self.last = Some(Last::Moved);
     }
 
     /// Records the state before an edit, unless the edit continues the step
-    /// before it. Any edit clears the redo history.
+    /// before it. Any edit clears the redo history. An edit replaces the
+    /// selection, so the selected text is removed first.
     fn edit(&mut self, kind: Last) {
-        let continues = self.last == Some(Last::Typing) && kind == Last::Typing;
+        let continues =
+            self.anchor.is_none() && self.last == Some(Last::Typing) && kind == Last::Typing;
         if !continues {
             self.undo.push(self.snapshot());
         }
         self.redo.clear();
         self.last = Some(kind);
+        if let Some(range) = self.selection() {
+            self.cursor = range.start;
+            self.text.drain(range);
+        }
+        self.anchor = None;
+    }
+
+    /// Deletes the selection, as one undo step. Returns false without one.
+    fn delete_selection(&mut self) -> bool {
+        if self.anchor.is_none() {
+            return false;
+        }
+        self.edit(Last::Other);
+        true
     }
 
     /// A cursor move ends the typing step, so the next typing starts a new one.
+    /// It also drops the selection: the selection is only kept by `extend_selection`.
     fn moved(&mut self) {
         self.last = Some(Last::Moved);
+        self.anchor = None;
     }
 
     fn line_start_index(&self) -> usize {
@@ -414,6 +519,75 @@ mod tests {
         buffer.line_start();
         buffer.word_forward();
         assert_eq!(buffer.cursor(), 3); // after "git"
+    }
+
+    #[test]
+    fn shift_motions_select_and_plain_motions_clear() {
+        let mut buffer = typed("git status");
+        buffer.extend_selection(Buffer::word_back);
+        assert_eq!(buffer.selected_text().as_deref(), Some("status"));
+        buffer.extend_selection(Buffer::word_back);
+        assert_eq!(buffer.selected_text().as_deref(), Some("git status"));
+        buffer.move_left();
+        assert_eq!(buffer.selection(), None);
+    }
+
+    #[test]
+    fn selection_runs_both_ways_and_empties_back_to_none() {
+        let mut buffer = typed("abc");
+        buffer.extend_selection(Buffer::move_left);
+        buffer.extend_selection(Buffer::move_left);
+        assert_eq!(buffer.selection(), Some(1..3));
+        buffer.extend_selection(Buffer::move_right);
+        buffer.extend_selection(Buffer::move_right);
+        assert_eq!(buffer.selection(), None);
+    }
+
+    #[test]
+    fn typing_replaces_the_selection_and_undo_restores_it() {
+        let mut buffer = typed("hello world");
+        buffer.extend_selection(Buffer::word_back);
+        buffer.insert_char('x');
+        assert_eq!(buffer.text(), "hello x");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "hello world");
+    }
+
+    #[test]
+    fn backspace_deletes_only_the_selection() {
+        let mut buffer = typed("abcdef");
+        buffer.extend_selection(Buffer::move_left);
+        buffer.extend_selection(Buffer::move_left);
+        buffer.backspace();
+        assert_eq!(buffer.text(), "abcd");
+        assert_eq!(buffer.cursor(), 4);
+    }
+
+    #[test]
+    fn double_click_selects_a_word_or_a_run() {
+        let mut buffer = typed("git commit -m");
+        buffer.select_word_at(6);
+        assert_eq!(buffer.selected_text().as_deref(), Some("commit"));
+        buffer.select_word_at(10);
+        assert_eq!(buffer.selected_text().as_deref(), Some(" "));
+        buffer.select_word_at(11);
+        assert_eq!(buffer.selected_text().as_deref(), Some("-"));
+        // A click past the end selects the last char.
+        buffer.select_word_at(99);
+        assert_eq!(buffer.selected_text().as_deref(), Some("m"));
+    }
+
+    #[test]
+    fn selection_moves_to_the_ends_of_the_text_and_line() {
+        let mut buffer = typed("one\ntwo");
+        buffer.extend_selection(Buffer::buffer_start);
+        assert_eq!(buffer.selected_text().as_deref(), Some("one\ntwo"));
+        buffer.set_cursor(0);
+        buffer.extend_selection(Buffer::line_end);
+        assert_eq!(buffer.selected_text().as_deref(), Some("one"));
+        buffer.set_cursor(7);
+        buffer.extend_selection(Buffer::line_start);
+        assert_eq!(buffer.selected_text().as_deref(), Some("two"));
     }
 
     #[test]

@@ -17,12 +17,17 @@ pub const END: &str = "__BLOCO_END";
 /// The outer script, run as `zsh -f -c DRIVER bloco <line>`. It needs the
 /// environment variable `BLOCO_SETUP` set to [`SETUP`]. Prints what the
 /// widget printed.
+///
+/// The line must never run. Every write uses `zpty -n`, since `zpty -w`
+/// alone adds a newline, which is Enter. Control characters (and DEL) are
+/// removed from the line, so it cannot carry its own Enter (^M, ^J, ^O).
 pub const DRIVER: &str = r##"
 zmodload zsh/zpty || exit 1
+_bloco_line=${1//[[:cntrl:]$'\x7f']/}
 zpty bloco env TERM=xterm zsh -f -i
-zpty -w bloco 'eval "$BLOCO_SETUP"'$'\n'
+zpty -n -w bloco 'eval "$BLOCO_SETUP"'$'\n'
 zpty -r bloco _bloco_ready '*__BLOCO_READY*'
-zpty -w bloco $'\x15'"$1"$'\t'$'\x18\x02'
+zpty -n -w bloco $'\x15'"$_bloco_line"$'\t'$'\x18\x02'
 zpty -r bloco _bloco_out '*__BLOCO_END*'
 print -r -- "$_bloco_out"
 zpty -d bloco
@@ -34,7 +39,16 @@ pub const SETUP: &str = r##"
 PS1=''
 RPS1=''
 autoload -Uz compinit
-compinit -u -C -d "${TMPDIR:-/tmp}/bloco-zcompdump"
+# compinit sources the dump, so it lives in a private per-user cache, not in
+# a shared temp dir. -i skips insecure fpath dirs without asking; -u would
+# trust them, and a prompt would hang the driver.
+if [[ $OSTYPE == darwin* ]]; then
+  _bloco_cache=$HOME/Library/Caches/bloco
+else
+  _bloco_cache=${XDG_CACHE_HOME:-$HOME/.cache}/bloco
+fi
+mkdir -p -m 700 -- $_bloco_cache 2>/dev/null
+compinit -i -C -d $_bloco_cache/zcompdump
 typeset -ga _bloco_out
 compadd() {
   local -i j skip=0 arrays=0
@@ -114,6 +128,68 @@ mod tests {
     fn parse_drops_repeats_and_blank_lines() {
         let output = "__BLOCO_BEGIN\n\nmain\nmain\n\nmaster\n__BLOCO_END";
         assert_eq!(parse(output), vec!["main", "master"]);
+    }
+
+    /// Runs the real driver in `dir` with `segment`, like the app does.
+    fn run_driver(dir: &std::path::Path, segment: &str) -> String {
+        let output = std::process::Command::new("zsh")
+            .args(["-f", "-c", DRIVER, "bloco", segment])
+            .env("BLOCO_SETUP", SETUP)
+            .current_dir(dir)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// A new empty directory for one test.
+    fn fresh_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "bloco-zsh-test-{name}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    fn has_zsh() -> bool {
+        std::process::Command::new("zsh")
+            .args(["-f", "-c", "true"])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[test]
+    fn tab_never_runs_the_typed_line() {
+        if !has_zsh() {
+            return;
+        }
+        let dir = fresh_dir("no-run");
+        run_driver(&dir, "touch marker");
+        // ^O is accept-line-and-down-history: it would run the line.
+        run_driver(&dir, "touch marker2\x0f x");
+        run_driver(&dir, "touch marker3\r x");
+        // A racing execution could land just after the driver returns.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let marker = dir.join("marker").exists();
+        let marker2 = dir.join("marker2").exists();
+        let marker3 = dir.join("marker3").exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!marker, "Tab ran the typed command");
+        assert!(!marker2, "a control character in the line ran it");
+        assert!(!marker3, "a carriage return in the line ran it");
+    }
+
+    #[test]
+    fn driver_completes_a_git_subcommand() {
+        if !has_zsh() {
+            return;
+        }
+        let dir = fresh_dir("git");
+        let words = parse(&run_driver(&dir, "git chec"));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(words.iter().any(|word| word == "checkout"), "{words:?}");
     }
 
     #[test]

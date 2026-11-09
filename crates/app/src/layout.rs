@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::split_tree::Axis;
+use crate::tab_groups::GroupId;
 
 /// The file in the settings directory that holds the layout.
 const FILE: &str = "layout.json";
@@ -20,6 +21,9 @@ pub struct SavedLayout {
     /// The sidebar's width in pixels. `None` in a layout saved before it was kept.
     #[serde(default)]
     pub sidebar_width: Option<f32>,
+    /// The tab groups. Empty in a layout saved before groups existed.
+    #[serde(default)]
+    pub groups: Vec<SavedGroup>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -27,6 +31,18 @@ pub struct SavedTab {
     pub root: SavedNode,
     /// The active pane, as its index in the tree's pane order.
     pub active: usize,
+    /// The name the user gave the tab. `None` shows the automatic title.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The group the tab is in. `None` when it is in no group.
+    #[serde(default)]
+    pub group: Option<GroupId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SavedGroup {
+    pub id: GroupId,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -35,6 +51,9 @@ pub enum SavedNode {
     Pane {
         /// The directory the shell was in. `None` when it was not known.
         cwd: Option<PathBuf>,
+        /// The name the user gave the session. `None` shows the automatic title.
+        #[serde(default)]
+        name: Option<String>,
     },
     Split {
         axis: Axis,
@@ -78,23 +97,33 @@ mod tests {
                 SavedTab {
                     root: SavedNode::Pane {
                         cwd: Some(PathBuf::from("/tmp/a")),
+                        name: Some("server".into()),
                     },
                     active: 0,
+                    name: Some("build".into()),
+                    group: Some(1),
                 },
                 SavedTab {
                     root: SavedNode::Split {
                         axis: Axis::Vertical,
                         ratio: 0.25,
-                        first: Box::new(SavedNode::Pane { cwd: None }),
+                        first: Box::new(SavedNode::Pane { cwd: None, name: None }),
                         second: Box::new(SavedNode::Pane {
                             cwd: Some(PathBuf::from("/tmp/b")),
+                            name: None,
                         }),
                     },
                     active: 1,
+                    name: None,
+                    group: None,
                 },
             ],
             active_tab: 1,
             sidebar_width: Some(300.0),
+            groups: vec![SavedGroup {
+                id: 1,
+                name: "Servers".into(),
+            }],
         }
     }
 
@@ -115,6 +144,23 @@ mod tests {
         let layout = load(&dir).expect("an old layout file loads");
         assert_eq!(layout.sidebar_width, None);
         assert_eq!(layout.tabs.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_layout_saved_before_names_and_groups_still_loads() {
+        let dir = std::env::temp_dir().join(format!("bloco-old-groups-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let old = r#"{"tabs":[{"root":{"kind":"pane","cwd":null},"active":0}],"active_tab":0,"sidebar_width":260.0}"#;
+        fs::write(dir.join(FILE), old).unwrap();
+        let layout = load(&dir).expect("a layout without names or groups loads");
+        assert_eq!(layout.tabs[0].name, None);
+        assert_eq!(layout.tabs[0].group, None);
+        assert!(layout.groups.is_empty());
+        assert_eq!(
+            layout.tabs[0].root,
+            SavedNode::Pane { cwd: None, name: None }
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

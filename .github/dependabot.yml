@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # Rust dependencies from crates.io. GPUI is a git dependency pinned to a Zed
+  # release in crates/app/Cargo.toml, and is moved by hand together with the
+  # [patch] table in the root Cargo.toml.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+
+  # The SHA pins in .github/workflows.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

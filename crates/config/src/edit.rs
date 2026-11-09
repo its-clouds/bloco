@@ -7,7 +7,7 @@ use std::path::Path;
 
 use toml_edit::{DocumentMut, Item, Table, Value};
 
-use crate::OptionAsMeta;
+use crate::{ClipboardWrite, OptionAsMeta};
 
 /// Sets `key` in `[table]` to `value` and returns the new text. An empty
 /// `table` means the top level. A missing table is added at the end.
@@ -69,6 +69,15 @@ pub fn set_background_opacity(text: &str, opacity: f32) -> Result<String, String
 /// Sets `[window] background_blur`.
 pub fn set_background_blur(text: &str, blur: bool) -> Result<String, String> {
     set(text, "window", "background_blur", blur)
+}
+
+/// Sets `[terminal] clipboard_write`.
+pub fn set_clipboard_write(text: &str, value: ClipboardWrite) -> Result<String, String> {
+    let value = match value {
+        ClipboardWrite::Allow => "allow",
+        ClipboardWrite::Deny => "deny",
+    };
+    set(text, "terminal", "clipboard_write", value)
 }
 
 /// Writes `text` to `path` through a temporary file, so a crash never leaves a
@@ -185,5 +194,21 @@ size = 13.0
         let parsed: toml::Table = toml::from_str(&text).unwrap();
         assert_eq!(parsed["font"]["size"].as_float(), Some(18.5));
         assert_eq!(parsed["font"]["family"].as_str(), Some("Menlo"));
+    }
+
+    #[test]
+    fn clipboard_write_values_round_trip() {
+        for value in [ClipboardWrite::Allow, ClipboardWrite::Deny] {
+            let text = set_clipboard_write(FILE, value).unwrap();
+            let settings = crate::Settings::parse(
+                &crate::Files {
+                    config: Some(text),
+                    ..crate::Files::default()
+                },
+                &[],
+            )
+            .unwrap();
+            assert_eq!(settings.config.terminal.clipboard_write, value);
+        }
     }
 }

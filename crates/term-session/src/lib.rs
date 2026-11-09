@@ -17,12 +17,12 @@ mod timing;
 pub use alacritty_terminal::term::cell::Flags;
 pub use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor};
 pub use blocks::{Block, Blocks, Row};
-pub use links::Link;
+pub use links::{Link, PathToken};
 pub use mode::InputMode;
 pub use osc133::{parse_payload, Mark, Scanner};
 pub use search::{BufferPoint, FindMatch, FindQuery, FindResults, MAX_MATCHES};
 pub use session::{
-    Cursor, Damage, Finder, Frame, LineDamage, Session, SessionEvent, Side, SelectionKind,
-    Snapshot, SnapshotCell, TermMode,
+    Cursor, Damage, Finder, Frame, LineDamage, SelectionKind, SelectionMotion, Session,
+    SessionEvent, Side, Snapshot, SnapshotCell, TermMode,
 };
 pub use timing::StartupTimer;

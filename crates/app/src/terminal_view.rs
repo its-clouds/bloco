@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_channel::Receiver;
-use config::OptionAsMeta;
+use config::{ClipboardWrite, OptionAsMeta};
 use gpui::{
     Anchor, AnyElement, App, Bounds, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
     InputHandler, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
@@ -22,7 +22,8 @@ use gpui::{
 use input_editor::completion::{Completion, Item};
 use input_editor::{Buffer, HistorySearch, wrap};
 use term_session::{
-    Block, FindQuery, InputMode, Link, Row, SelectionKind, Session, SessionEvent, TermMode,
+    Block, FindQuery, InputMode, Row, SelectionKind, SelectionMotion, Session,
+    SessionEvent, TermMode,
 };
 
 use crate::block_header::{display_dir, shorten};
@@ -34,6 +35,7 @@ use crate::commands::{
     TextWordForward,
 };
 use crate::completion;
+use crate::file_links;
 use crate::find::{FindState, Pick};
 use crate::git;
 use crate::keys::{TextEdit, text_edit_bytes, text_edit_for, to_esc_str};
@@ -53,6 +55,8 @@ pub enum TerminalEvent {
     TabTitleChanged,
     /// The shell closed the PTY, usually because it exited.
     Exited,
+    /// Cmd+Shift+click on a file: show it in the preview panel.
+    OpenPreview(PathBuf),
 }
 
 /// The settings that change how a terminal looks and types.
@@ -62,6 +66,8 @@ pub struct TerminalStyle {
     pub font_family: SharedString,
     pub font_size: Pixels,
     pub option_as_meta: OptionAsMeta,
+    /// Whether OSC 52 from the shell may replace the clipboard.
+    pub clipboard_write: ClipboardWrite,
 }
 
 /// How long new output waits before it reruns an open search. Output during the
@@ -73,10 +79,23 @@ const CURSOR_BLINK: Duration = Duration::from_millis(530);
 /// How long the visual bell tints the pane.
 const BELL_FLASH: Duration = Duration::from_millis(150);
 
-/// A URL under the mouse while Cmd is held.
+/// What a link under the mouse goes to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LinkTarget {
+    Url(String),
+    /// A file or directory that exists on disk.
+    Path(PathBuf),
+}
+
+/// A link under the mouse while Cmd is held.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct HoveredLink {
+    /// Screen row, as the element draws it.
     line: usize,
-    link: Link,
+    /// Columns covered by the link, inclusive.
+    first_column: usize,
+    last_column: usize,
+    target: LinkTarget,
 }
 
 pub struct TerminalView {
@@ -86,16 +105,21 @@ pub struct TerminalView {
     font_family: SharedString,
     font_size: Pixels,
     option_as_meta: OptionAsMeta,
+    clipboard_write: ClipboardWrite,
     metrics: Rc<Cell<Metrics>>,
     /// Preedit text from the input method, not yet committed to the shell.
     marked_text: Option<String>,
     /// The left button is down and the drag extends a selection.
     selecting: bool,
+    /// The left button is down in the input editor, and the drag extends its selection.
+    prompt_selecting: bool,
     hovered_link: Option<HoveredLink>,
     /// Wheel movement in pixels that has not added up to a whole line yet.
     scroll_pixels: f32,
     /// The tab label as of the last output, to report only real changes.
     tab_label: String,
+    /// The name the user gave the session. `None` shows the automatic title.
+    custom_title: Option<String>,
     /// The find bar, while it is open.
     find: Option<FindState>,
     find_focus: FocusHandle,
@@ -161,12 +185,15 @@ impl TerminalView {
             font_family: style.font_family,
             font_size: style.font_size,
             option_as_meta: style.option_as_meta,
+            clipboard_write: style.clipboard_write,
             metrics: Rc::new(Cell::new(Metrics::default())),
             marked_text: None,
             selecting: false,
+            prompt_selecting: false,
             hovered_link: None,
             scroll_pixels: 0.0,
             tab_label,
+            custom_title: None,
             find: None,
             find_focus: cx.focus_handle(),
             last_find: FindQuery::default(),
@@ -226,6 +253,7 @@ impl TerminalView {
         self.font_family = style.font_family;
         self.font_size = style.font_size;
         self.option_as_meta = style.option_as_meta;
+        self.clipboard_write = style.clipboard_write;
         self.fit_grid(cx);
         cx.notify();
     }
@@ -263,9 +291,26 @@ impl TerminalView {
         self.session.cwd()
     }
 
-    /// The tab label: the running command, or the last part of the directory.
+    /// The name the user gave the session, if any.
+    pub fn custom_title(&self) -> Option<&str> {
+        self.custom_title.as_deref()
+    }
+
+    /// Sets or clears the name the user gave the session. Tabs report the change.
+    pub fn set_custom_title(&mut self, title: Option<String>, cx: &mut Context<Self>) {
+        if self.custom_title != title {
+            self.custom_title = title;
+            cx.emit(TerminalEvent::TabTitleChanged);
+            cx.notify();
+        }
+    }
+
+    /// The tab label: the name the user gave the session, else the running
+    /// command, or the last part of the directory.
     pub fn tab_title(&self) -> String {
-        tab_label(&self.session)
+        self.custom_title
+            .clone()
+            .unwrap_or_else(|| tab_label(&self.session))
     }
 
     /// The git branch of the shell's directory, as of the last prompt. `None`
@@ -315,7 +360,9 @@ impl TerminalView {
             SessionEvent::Title(title) => cx.emit(TerminalEvent::Title(title)),
             SessionEvent::Exit => cx.emit(TerminalEvent::Exited),
             SessionEvent::Clipboard(text) => {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                if self.clipboard_write == ClipboardWrite::Allow {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
             }
             SessionEvent::Bell => self.ring_bell(cx),
         }
@@ -350,6 +397,19 @@ impl TerminalView {
             return;
         }
 
+        // Shift+arrows move a selection through the output. Full-screen apps get the keys.
+        if modifiers.shift
+            && !modifiers.control
+            && !modifiers.alt
+            && !mode.contains(TermMode::ALT_SCREEN)
+            && let Some(motion) = grid_selection_motion(&keystroke.key, modifiers.platform)
+        {
+            self.session.extend_selection_by(motion);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+
         // Cmd belongs to the app's shortcuts (Cmd+Opt+arrows move between panes),
         // so it is never sent to the shell. Keys without a shortcut are dropped.
         if modifiers.platform {
@@ -366,12 +426,15 @@ impl TerminalView {
 
         // Option as Meta: send ESC before the key, instead of the character the
         // Option key composes (which is why this comes before the IME check below).
-        if modifiers.alt && !modifiers.control && !modifiers.platform && self.option_sends_meta() {
-            if let Some(esc) = to_esc_str(keystroke, mode, true) {
-                self.send_input(esc.as_bytes());
-                cx.stop_propagation();
-                return;
-            }
+        if modifiers.alt
+            && !modifiers.control
+            && !modifiers.platform
+            && self.option_sends_meta()
+            && let Some(esc) = to_esc_str(keystroke, mode, true)
+        {
+            self.send_input(esc.as_bytes());
+            cx.stop_propagation();
+            return;
         }
 
         // Printable keys (including dead keys and IME composition) arrive through
@@ -447,7 +510,15 @@ impl TerminalView {
     }
 
     fn copy(&mut self, _: &CopySelection, _window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = self.session.selection_text().filter(|t| !t.is_empty()) {
+        // While the input editor owns the keys, its selection is what copies.
+        let prompt_text = self
+            .owns_input()
+            .then(|| self.prompt.buffer.selected_text())
+            .flatten();
+        if let Some(text) = prompt_text
+            .or_else(|| self.session.selection_text())
+            .filter(|t| !t.is_empty())
+        {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
@@ -457,7 +528,7 @@ impl TerminalView {
             return;
         };
         if self.owns_input() {
-            let text = text.replace("\r\n", "\n").replace('\r', "\n").replace('\x1b', "");
+            let text = prompt::sanitize_paste(&text);
             self.edit_buffer(|buffer| buffer.insert_str(&text));
             cx.notify();
             return;
@@ -479,9 +550,17 @@ impl TerminalView {
                 TextEdit::DeleteWordBack => self.edit_buffer(Buffer::delete_word_back),
                 TextEdit::DeleteToLineStart => self.edit_buffer(Buffer::delete_to_line_start),
                 TextEdit::WordBack => self.prompt.buffer.word_back(),
-                TextEdit::WordForward => self.prompt.buffer.word_forward(),
+                TextEdit::WordForward => {
+                    if !self.accept_suggestion(true) {
+                        self.prompt.buffer.word_forward();
+                    }
+                }
                 TextEdit::LineStart => self.prompt.buffer.line_start(),
-                TextEdit::LineEnd => self.prompt.buffer.line_end(),
+                TextEdit::LineEnd => {
+                    if !self.accept_suggestion(false) {
+                        self.prompt.buffer.line_end();
+                    }
+                }
             }
             cx.notify();
             return;
@@ -572,10 +651,10 @@ impl TerminalView {
                 if !find.set_results(generation, results, pick) {
                     return;
                 }
-                if pick == Pick::Newest {
-                    if let Some(found) = find.current_match() {
-                        view.session.scroll_to_line(found.start.line);
-                    }
+                if pick == Pick::Newest
+                    && let Some(found) = find.current_match()
+                {
+                    view.session.scroll_to_line(found.start.line);
                 }
                 cx.notify();
             });
@@ -802,8 +881,15 @@ impl TerminalView {
         if event.button == MouseButton::Left
             && !event.modifiers.shift
             && self.owns_input()
-            && self.place_cursor(event.position)
+            && let Some(index) = self.editor_index_at(event.position)
         {
+            // A double click selects the word under the pointer. A drag extends from there.
+            if event.click_count == 2 {
+                self.prompt.buffer.select_word_at(index);
+            } else {
+                self.prompt.buffer.set_cursor(index);
+            }
+            self.prompt_selecting = true;
             cx.notify();
             return;
         }
@@ -814,11 +900,19 @@ impl TerminalView {
         }
 
         if event.button == MouseButton::Left && event.modifiers.secondary() {
-            if let Some(Row::Line(buffer_line)) = row {
-                if let Some(link) = self.session.url_at(buffer_line, column) {
-                    cx.open_url(&link.url);
-                    return;
+            let hit = match row {
+                Some(Row::Line(buffer_line)) => self.link_under(line, buffer_line, column),
+                _ => None,
+            };
+            if let Some(hit) = hit {
+                match hit.target {
+                    LinkTarget::Url(url) => cx.open_url(&url),
+                    LinkTarget::Path(path) if event.modifiers.shift && path.is_file() => {
+                        cx.emit(TerminalEvent::OpenPreview(path));
+                    }
+                    LinkTarget::Path(path) => file_links::reveal_in_finder(&path),
                 }
+                return;
             }
         }
 
@@ -839,21 +933,18 @@ impl TerminalView {
             } else {
                 self.selected_block.set(None);
             }
-            match row {
-                Some(Row::Line(buffer_line)) => {
-                    if event.modifiers.shift && self.session.selection_text().is_some() {
-                        self.session.update_selection(buffer_line, column, side);
-                    } else {
-                        let kind = match event.click_count {
-                            2 => SelectionKind::Semantic,
-                            3 => SelectionKind::Lines,
-                            _ => SelectionKind::Simple,
-                        };
-                        self.session.start_selection(kind, buffer_line, column, side);
-                    }
-                    self.selecting = true;
+            if let Some(Row::Line(buffer_line)) = row {
+                if event.modifiers.shift && self.session.selection_text().is_some() {
+                    self.session.update_selection(buffer_line, column, side);
+                } else {
+                    let kind = match event.click_count {
+                        2 => SelectionKind::Semantic,
+                        3 => SelectionKind::Lines,
+                        _ => SelectionKind::Simple,
+                    };
+                    self.session.start_selection(kind, buffer_line, column, side);
                 }
-                _ => {}
+                self.selecting = true;
             }
         }
         cx.notify();
@@ -874,6 +965,7 @@ impl TerminalView {
         }
         if event.button == MouseButton::Left {
             self.selecting = false;
+            self.prompt_selecting = false;
         }
         cx.notify();
     }
@@ -892,26 +984,63 @@ impl TerminalView {
             return;
         }
 
-        if self.selecting && event.pressed_button == Some(MouseButton::Left) {
-            if let Some(Row::Line(buffer_line)) = self.row_at(line) {
-                self.session.update_selection(buffer_line, column, side);
-                cx.notify();
-            }
+        if self.prompt_selecting
+            && event.pressed_button == Some(MouseButton::Left)
+            && let Some(index) = self.editor_index_at(event.position)
+        {
+            self.prompt.buffer.extend_selection(|buffer| buffer.set_cursor(index));
+            cx.notify();
+        }
+
+        if self.selecting
+            && event.pressed_button == Some(MouseButton::Left)
+            && let Some(Row::Line(buffer_line)) = self.row_at(line)
+        {
+            self.session.update_selection(buffer_line, column, side);
+            cx.notify();
         }
 
         let hovered = match self.row_at(line) {
-            Some(Row::Line(buffer_line)) if event.modifiers.secondary() => self
-                .session
-                .url_at(buffer_line, column)
-                .map(|link| HoveredLink { line, link }),
+            Some(Row::Line(buffer_line)) if event.modifiers.secondary() => {
+                self.link_under(line, buffer_line, column)
+            }
             _ => None,
         };
-        if hovered.as_ref().map(|h| (h.line, &h.link))
-            != self.hovered_link.as_ref().map(|h| (h.line, &h.link))
-        {
+        if hovered != self.hovered_link {
             self.hovered_link = hovered;
             cx.notify();
         }
+    }
+
+    /// The URL or existing file path under a cell. `line` is the screen row,
+    /// `buffer_line` the buffer row the cell is on.
+    fn link_under(&self, line: usize, buffer_line: usize, column: usize) -> Option<HoveredLink> {
+        if let Some(link) = self.session.url_at(buffer_line, column) {
+            // A file URL is a path link, so Cmd+click never opens (and runs)
+            // it. Only web URLs go to the browser.
+            let target = if let Some(path) = file_links::file_url_path(&link.url) {
+                LinkTarget::Path(path.exists().then_some(path)?)
+            } else if file_links::is_web_url(&link.url) {
+                LinkTarget::Url(link.url)
+            } else {
+                return None;
+            };
+            return Some(HoveredLink {
+                line,
+                first_column: link.first_column,
+                last_column: link.last_column,
+                target,
+            });
+        }
+        let token = self.session.path_at(buffer_line, column)?;
+        let base = self.session.dir_for_line(buffer_line);
+        let path = file_links::resolve(&token.text, base.as_deref())?;
+        Some(HoveredLink {
+            line,
+            first_column: token.first_column,
+            last_column: token.last_column,
+            target: LinkTarget::Path(path),
+        })
     }
 
     fn scroll_wheel(&mut self, event: &ScrollEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1091,6 +1220,16 @@ impl TerminalView {
         let modifiers = keystroke.modifiers;
         let key = keystroke.key.as_ref();
 
+        // Shift+arrows extend the selection, Option by word and Cmd by line.
+        if modifiers.shift
+            && !modifiers.control
+            && self.prompt.search.is_none()
+            && let Some(motion) = selection_motion(key, modifiers.alt, modifiers.platform)
+        {
+            self.prompt.buffer.extend_selection(motion);
+            return Self::consumed(cx);
+        }
+
         if modifiers.platform {
             match key {
                 "z" if modifiers.shift => self.prompt.buffer.redo(),
@@ -1115,13 +1254,21 @@ impl TerminalView {
             "backspace" => self.edit_buffer(Buffer::backspace),
             "delete" => self.edit_buffer(Buffer::delete_forward),
             "left" => self.prompt.buffer.move_left(),
-            "right" => self.prompt.buffer.move_right(),
+            "right" => {
+                if !self.accept_suggestion(false) {
+                    self.prompt.buffer.move_right();
+                }
+            }
             "up" if self.prompt.buffer.is_first_line() => self.recall(true),
             "up" => self.prompt.buffer.move_up(),
             "down" if self.prompt.buffer.is_last_line() => self.recall(false),
             "down" => self.prompt.buffer.move_down(),
             "home" => self.prompt.buffer.line_start(),
-            "end" => self.prompt.buffer.line_end(),
+            "end" => {
+                if !self.accept_suggestion(false) {
+                    self.prompt.buffer.line_end();
+                }
+            }
             "escape" => self.selected_block.set(None),
             // Shift+PageUp and Shift+PageDown scroll the pane, as they do everywhere.
             "pageup" | "pagedown" if modifiers.shift => return false,
@@ -1140,9 +1287,17 @@ impl TerminalView {
     fn control_key(&mut self, key: &str) {
         match key {
             "a" => self.prompt.buffer.line_start(),
-            "e" => self.prompt.buffer.line_end(),
+            "e" => {
+                if !self.accept_suggestion(false) {
+                    self.prompt.buffer.line_end();
+                }
+            }
             "b" => self.prompt.buffer.move_left(),
-            "f" => self.prompt.buffer.move_right(),
+            "f" => {
+                if !self.accept_suggestion(false) {
+                    self.prompt.buffer.move_right();
+                }
+            }
             "h" => self.edit_buffer(Buffer::backspace),
             "u" => self.edit_buffer(Buffer::delete_to_line_start),
             "w" => self.edit_buffer(Buffer::delete_word_back),
@@ -1217,6 +1372,20 @@ impl TerminalView {
                 buffer.insert_char(c);
             }
         });
+    }
+
+    /// Accepts the inline suggestion, or only its first word. False when there is none.
+    fn accept_suggestion(&mut self, word_only: bool) -> bool {
+        let Some(suggestion) = self.prompt.suggestion() else {
+            return false;
+        };
+        let text = if word_only {
+            prompt::first_word(&suggestion).to_string()
+        } else {
+            suggestion
+        };
+        self.edit_buffer(|buffer| buffer.insert_str(&text));
+        true
     }
 
     /// Runs an edit on the editor's buffer. Editing ends a walk through the
@@ -1395,31 +1564,61 @@ impl TerminalView {
         )
     }
 
-    /// Moves the editor's cursor to a click on the editor's rows in the dock.
-    /// Returns false when the click is not on them, so the dock ignores it.
-    fn place_cursor(&mut self, position: Point<Pixels>) -> bool {
+    /// The editor's char index under a point in the dock, where a click or a drag
+    /// lands. `None` when the point is not on the editor's rows, so the dock ignores it.
+    fn editor_index_at(&self, position: Point<Pixels>) -> Option<usize> {
         if self.prompt.search.is_some() {
-            return false;
+            return None;
         }
-        let Some(geometry) = self.prompt.geometry.get() else {
-            return false;
-        };
+        let geometry = self.prompt.geometry.get()?;
         let y = f32::from(position.y - geometry.origin.y);
         if y < 0.0 {
-            return false;
+            return None;
         }
         let x = f32::from(position.x - geometry.origin.x).max(0.0);
         let row = (y / f32::from(geometry.line_height)) as usize;
         let column = (x / f32::from(geometry.cell_width)) as usize;
         let chars: Vec<char> = self.prompt.buffer.text().chars().collect();
         let rows = wrap(&chars, geometry.columns, geometry.columns);
-        let Some(range) = rows.get(row) else {
-            return false;
-        };
+        let range = rows.get(row)?;
         let offset = column.min(range.len());
-        self.prompt.buffer.set_cursor(range.start + offset);
-        true
+        Some(range.start + offset)
     }
+}
+
+/// The motion a Shift+arrow key gives the output's selection. Cmd moves to the
+/// line's ends, or to the text's ends with Up and Down. Keys without a motion return `None`.
+fn grid_selection_motion(key: &str, cmd: bool) -> Option<SelectionMotion> {
+    Some(match (key, cmd) {
+        ("left", false) => SelectionMotion::Left,
+        ("right", false) => SelectionMotion::Right,
+        ("up", false) => SelectionMotion::Up,
+        ("down", false) => SelectionMotion::Down,
+        ("left", true) | ("home", false) => SelectionMotion::LineStart,
+        ("right", true) | ("end", false) => SelectionMotion::LineEnd,
+        ("up", true) => SelectionMotion::BufferStart,
+        ("down", true) => SelectionMotion::BufferEnd,
+        _ => return None,
+    })
+}
+
+/// The cursor motion that a Shift+arrow key extends the editor's selection with.
+/// Option moves by word. Cmd moves to the line's ends, or to the text's ends with
+/// Up and Down. Keys without a motion return `None`.
+fn selection_motion(key: &str, alt: bool, cmd: bool) -> Option<fn(&mut Buffer)> {
+    Some(match (key, alt, cmd) {
+        ("left", false, false) => Buffer::move_left,
+        ("right", false, false) => Buffer::move_right,
+        ("up", false, false) => Buffer::move_up,
+        ("down", false, false) => Buffer::move_down,
+        ("left", true, false) => Buffer::word_back,
+        ("right", true, false) => Buffer::word_forward,
+        ("left", false, true) | ("home", false, false) => Buffer::line_start,
+        ("right", false, true) | ("end", false, false) => Buffer::line_end,
+        ("up", false, true) => Buffer::buffer_start,
+        ("down", false, true) => Buffer::buffer_end,
+        _ => return None,
+    })
 }
 
 impl Focusable for TerminalView {
@@ -1434,7 +1633,7 @@ impl Render for TerminalView {
         let hovered_link = self
             .hovered_link
             .as_ref()
-            .map(|h| (h.line, h.link.first_column, h.link.last_column));
+            .map(|h| (h.line, h.first_column, h.last_column));
         let find = self
             .find
             .as_ref()

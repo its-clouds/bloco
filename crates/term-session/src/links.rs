@@ -49,6 +49,109 @@ pub fn link_at(row: &[(char, Flags)], column: usize) -> Option<Link> {
     None
 }
 
+/// A path-looking token on one line of the grid. Not checked against the disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathToken {
+    /// The path as printed, without quotes, brackets or a `:LINE[:COL]` suffix.
+    pub text: String,
+    /// Columns covered by the path, inclusive.
+    pub first_column: usize,
+    pub last_column: usize,
+}
+
+/// Opening characters that wrap a path in output, such as `"a.rs"` or `(b/c)`.
+const LEADING: &[char] = &['"', '\'', '`', '(', '[', '<', '{'];
+/// Closing characters and sentence punctuation that follow a path.
+const TRAILING: &[char] = &['"', '\'', '`', ')', ']', '>', '}', ',', ';', '.', ':', '!', '?'];
+
+/// The path-looking token that covers `column` on this line, if there is one.
+/// A token is the run of non-blank characters around the cursor, trimmed of
+/// wrapping quotes, brackets and punctuation, and of a `:LINE` or `:LINE:COL`
+/// suffix as compilers print them. A token must contain a letter and either a
+/// `/`, a leading `~`, or a `.`, so a bare word such as `total` is not one.
+pub fn path_at(row: &[(char, Flags)], column: usize) -> Option<PathToken> {
+    let mut chars = Vec::with_capacity(row.len());
+    let mut columns = Vec::with_capacity(row.len());
+    for (col, &(c, flags)) in row.iter().enumerate() {
+        if flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
+        chars.push(c);
+        columns.push(col);
+    }
+
+    let hit = columns.partition_point(|&c| c <= column).checked_sub(1)?;
+    if chars[hit].is_whitespace() {
+        return None;
+    }
+
+    // The run of non-blank characters around the hit.
+    let mut start = hit;
+    while start > 0 && !chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    let mut end = hit + 1;
+    while end < chars.len() && !chars[end].is_whitespace() {
+        end += 1;
+    }
+
+    // Wrapping characters on both sides. The hit must survive the trimming.
+    while start < end && LEADING.contains(&chars[start]) {
+        start += 1;
+    }
+    end = trim_trailing(&chars, start, end);
+    for _ in 0..2 {
+        end = strip_line_suffix(&chars, start, end);
+        end = trim_trailing(&chars, start, end);
+    }
+    if start >= end || hit < start || hit >= end {
+        return None;
+    }
+
+    let text: String = chars[start..end].iter().collect();
+    if text.contains("://") || !looks_like_path(&text) {
+        return None;
+    }
+    Some(PathToken {
+        text,
+        first_column: columns[start],
+        last_column: columns[end - 1],
+    })
+}
+
+/// `end` after dropping trailing wrapping characters and punctuation.
+fn trim_trailing(chars: &[char], start: usize, mut end: usize) -> usize {
+    while end > start && TRAILING.contains(&chars[end - 1]) {
+        end -= 1;
+    }
+    end
+}
+
+/// `end` before a `:LINE` or `:LINE:COL` suffix made only of digits. Returns
+/// `end` unchanged when there is no such suffix.
+fn strip_line_suffix(chars: &[char], start: usize, end: usize) -> usize {
+    let digits = chars[start..end]
+        .iter()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .count();
+    if digits == 0 || digits == end - start {
+        return end;
+    }
+    let colon = end - digits - 1;
+    if chars[colon] == ':' && colon > start {
+        colon
+    } else {
+        end
+    }
+}
+
+fn looks_like_path(text: &str) -> bool {
+    let has_letter = text.chars().any(|c| c.is_alphabetic());
+    let shaped = text.contains('/') || text.starts_with('~') || text.contains('.');
+    has_letter && shaped
+}
+
 fn starts_with_scheme(chars: &[char]) -> bool {
     SCHEMES.iter().any(|scheme| {
         let scheme: Vec<char> = scheme.chars().collect();
@@ -164,5 +267,70 @@ mod tests {
     #[test]
     fn plain_words_are_not_urls() {
         assert_eq!(url_in("httpd is running", 2), None);
+    }
+
+    fn path_in(text: &str, column: usize) -> Option<String> {
+        path_at(&row(text), column).map(|token| token.text)
+    }
+
+    #[test]
+    fn finds_file_names_from_ls_output() {
+        assert_eq!(path_in("README.md  Cargo.toml", 2).as_deref(), Some("README.md"));
+        assert_eq!(path_in("README.md  Cargo.toml", 12).as_deref(), Some("Cargo.toml"));
+    }
+
+    #[test]
+    fn finds_relative_and_home_paths() {
+        assert_eq!(path_in("./src/lib.rs", 4).as_deref(), Some("./src/lib.rs"));
+        assert_eq!(path_in("open ~/notes/a.md", 9).as_deref(), Some("~/notes/a.md"));
+    }
+
+    #[test]
+    fn drops_line_and_column_suffix() {
+        assert_eq!(
+            path_in("error at src/main.rs:42:7 here", 12).as_deref(),
+            Some("src/main.rs")
+        );
+        assert_eq!(path_in("src/main.rs:42", 0).as_deref(), Some("src/main.rs"));
+        let token = path_at(&row("src/main.rs:42:7"), 2).unwrap();
+        assert_eq!((token.first_column, token.last_column), (0, 10));
+    }
+
+    #[test]
+    fn trims_quotes_brackets_and_punctuation() {
+        assert_eq!(path_in("\"my/file.txt\",", 3).as_deref(), Some("my/file.txt"));
+        assert_eq!(path_in("(see docs/a.md).", 6).as_deref(), Some("docs/a.md"));
+        assert_eq!(path_in("'a/b.rs'", 2).as_deref(), Some("a/b.rs"));
+    }
+
+    #[test]
+    fn misses_the_wrapping_characters() {
+        assert_eq!(path_in("(docs/a.md)", 0), None);
+    }
+
+    #[test]
+    fn urls_are_not_paths() {
+        assert_eq!(path_in("https://example.com/a.html", 10), None);
+        assert_eq!(path_in("file:///tmp/a.txt", 8), None);
+    }
+
+    #[test]
+    fn bare_words_and_numbers_are_not_paths() {
+        assert_eq!(path_in("total 48", 1), None);
+        assert_eq!(path_in("ratio 3.14 now", 7), None);
+        assert_eq!(path_in("... done", 1), None);
+    }
+
+    #[test]
+    fn blank_cells_are_not_paths() {
+        assert_eq!(path_in("a/b.rs   ", 6), None);
+    }
+
+    #[test]
+    fn path_columns_skip_wide_characters() {
+        // `日` takes columns 0 and 1, so the path starts at column 3.
+        let token = path_at(&row("日 src/a.rs"), 5).unwrap();
+        assert_eq!(token.text, "src/a.rs");
+        assert_eq!((token.first_column, token.last_column), (3, 10));
     }
 }

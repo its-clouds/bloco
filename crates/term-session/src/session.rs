@@ -22,7 +22,7 @@ use crate::blocks::{self, Block, Blocks, Row};
 use crate::cwd::pid_cwd;
 use crate::links;
 use crate::mode::InputMode;
-use crate::osc133::{Mark, Scanner};
+use crate::osc133::{self, Mark, Scanner};
 use crate::reflow::Layout;
 use crate::search::{self, BufferPoint, FindQuery, FindResults};
 use crate::shell::{self, ScriptDir};
@@ -66,6 +66,30 @@ pub struct Session {
     /// The scripts that start the shell with integration. Only kept so they are
     /// removed on drop.
     _scripts: Option<ScriptDir>,
+    /// Where the selection starts and where its moving end is. Alacritty keeps
+    /// these private, and the keyboard moves the end.
+    selection_ends: Mutex<Option<SelectionEnds>>,
+}
+
+/// The two ends of a selection, as buffer cells.
+#[derive(Clone, Copy)]
+struct SelectionEnds {
+    anchor: BufferPoint,
+    focus: BufferPoint,
+}
+
+/// A cursor motion that moves the end of the selection, in buffer cells.
+/// Lines wrap at the screen's width, so Left and Right cross line breaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionMotion {
+    Left,
+    Right,
+    Up,
+    Down,
+    LineStart,
+    LineEnd,
+    BufferStart,
+    BufferEnd,
 }
 
 struct State {
@@ -335,6 +359,12 @@ impl Session {
             }
         }
         let scripts = shell::configure(shell, &mut command)?;
+        // With the integration, only marks that carry this nonce are taken, so
+        // program output cannot forge them. See the osc133 module.
+        let nonce = scripts.is_some().then(osc133::new_nonce);
+        if let Some(nonce) = &nonce {
+            command.env("BLOCO_NONCE", nonce);
+        }
 
         let child = pair
             .slave
@@ -363,7 +393,7 @@ impl Session {
             blocks: Blocks::default(),
             scrollback: Scrollback::default(),
         }));
-        spawn_reader(reader, state.clone(), listener);
+        spawn_reader(reader, state.clone(), listener, nonce);
 
         Ok(Self {
             master: pair.master,
@@ -372,6 +402,7 @@ impl Session {
             pid,
             state,
             _scripts: scripts,
+            selection_ends: Mutex::new(None),
         })
     }
 
@@ -530,6 +561,11 @@ impl Session {
         let mut state = self.state.lock().expect("state lock poisoned");
         let point = grid_point(&state.term, line, column);
         state.term.selection = Some(Selection::new(kind, point, side));
+        let at = BufferPoint { line, column };
+        *self.selection_ends.lock().expect("selection lock poisoned") = Some(SelectionEnds {
+            anchor: at,
+            focus: at,
+        });
     }
 
     /// Extends the selection to a buffer cell. Does nothing without a selection.
@@ -538,11 +574,68 @@ impl Session {
         let point = grid_point(&state.term, line, column);
         if let Some(selection) = state.term.selection.as_mut() {
             selection.update(point, side);
+            if let Some(ends) = self.selection_ends.lock().expect("selection lock poisoned").as_mut() {
+                ends.focus = BufferPoint { line, column };
+            }
         }
     }
 
     pub fn clear_selection(&self) {
         self.state.lock().expect("state lock poisoned").term.selection = None;
+        *self.selection_ends.lock().expect("selection lock poisoned") = None;
+    }
+
+    /// Moves the selection's moving end by one motion, as Shift+arrows do. Without a
+    /// selection, one starts at the cursor. The view scrolls to keep the end on screen.
+    /// Does nothing on the alternate screen.
+    pub fn extend_selection_by(&self, motion: SelectionMotion) {
+        let focus = {
+            let mut state = self.state.lock().expect("state lock poisoned");
+            let term = &mut state.term;
+            let Some(cursor) = buffer_point(term) else {
+                return;
+            };
+            let mut ends_guard = self.selection_ends.lock().expect("selection lock poisoned");
+            // Without a selection, one starts at the cursor. A selection that is empty
+            // (its end came back to the anchor) keeps its anchor.
+            let ends = (*ends_guard).unwrap_or(SelectionEnds {
+                anchor: cursor,
+                focus: cursor,
+            });
+            let cols = term.columns().max(1);
+            let total_lines = term.grid().history_size() + term.screen_lines();
+            let linear = |p: BufferPoint| p.line * cols + p.column.min(cols - 1);
+            let to = motion_target(motion, linear(ends.focus), cols, total_lines);
+            let focus = BufferPoint {
+                line: to / cols,
+                column: to % cols,
+            };
+            let anchor = ends.anchor;
+            let kind = term.selection.as_ref().map_or(SelectionKind::Simple, |s| s.ty);
+            *ends_guard = Some(SelectionEnds { anchor, focus });
+
+            // The cells between the ends are selected. The end nearer the anchor sits on
+            // the near side of its cell, so the cell at each end is included.
+            if focus == anchor {
+                term.selection = None;
+            } else {
+                let forward = linear(focus) > linear(anchor);
+                let (anchor_side, focus_side) = if forward {
+                    (Side::Left, Side::Right)
+                } else {
+                    (Side::Right, Side::Left)
+                };
+                let mut selection = Selection::new(
+                    kind,
+                    grid_point(term, anchor.line, anchor.column),
+                    anchor_side,
+                );
+                selection.update(grid_point(term, focus.line, focus.column), focus_side);
+                term.selection = Some(selection);
+            }
+            focus
+        };
+        self.scroll_to_line(focus.line);
     }
 
     /// The selected text, or `None` without a selection.
@@ -556,16 +649,35 @@ impl Session {
 
     /// The URL under a buffer cell, if there is one.
     pub fn url_at(&self, line: usize, column: usize) -> Option<links::Link> {
+        links::link_at(&self.line_cells(line), column)
+    }
+
+    /// The file path under a buffer cell, if there is one. The path is not
+    /// checked against the disk; resolve it with [`Session::dir_for_line`].
+    pub fn path_at(&self, line: usize, column: usize) -> Option<links::PathToken> {
+        links::path_at(&self.line_cells(line), column)
+    }
+
+    /// The directory that relative paths printed at buffer `line` are based
+    /// on: the directory the shell was in when the block that holds the line
+    /// ran, else the shell's current directory.
+    pub fn dir_for_line(&self, line: usize) -> Option<PathBuf> {
+        self.previous_block(line)
+            .and_then(|block| block.cwd)
+            .or_else(|| self.cwd())
+    }
+
+    /// Character and flags of every cell on buffer `line`, index == column.
+    fn line_cells(&self, line: usize) -> Vec<(char, Flags)> {
         let state = self.state.lock().expect("state lock poisoned");
         let term = &state.term;
         let grid_line = grid_line(term, line);
-        let row: Vec<_> = (0..term.columns())
+        (0..term.columns())
             .map(|c| {
                 let cell = &term.grid()[grid_line][Column(c)];
                 (cell.c, cell.flags)
             })
-            .collect();
-        links::link_at(&row, column)
+            .collect()
     }
 
     /// The buffer line at the top of the view. Its frame may start above it,
@@ -874,6 +986,56 @@ fn grid_line(term: &Term<PtyResponder>, line: usize) -> Line {
     Line(line as i32 - term.grid().history_size() as i32)
 }
 
+/// Where a motion takes a cell. Cells are numbered across the lines, `cols` to a
+/// line and `total_lines` lines in all, so Left and Right wrap at the line ends.
+fn motion_target(motion: SelectionMotion, from: usize, cols: usize, total_lines: usize) -> usize {
+    let last = total_lines * cols - 1;
+    match motion {
+        SelectionMotion::Left => from.saturating_sub(1),
+        SelectionMotion::Right => (from + 1).min(last),
+        SelectionMotion::Up => from.saturating_sub(cols),
+        SelectionMotion::Down => (from + cols).min(last),
+        SelectionMotion::LineStart => from / cols * cols,
+        SelectionMotion::LineEnd => from / cols * cols + cols - 1,
+        SelectionMotion::BufferStart => 0,
+        SelectionMotion::BufferEnd => last,
+    }
+}
+
+#[cfg(test)]
+mod motion_tests {
+    use super::{motion_target, SelectionMotion as M};
+
+    // Ten cells to a line, three lines: cells 0..30.
+    fn to(motion: M, from: usize) -> usize {
+        motion_target(motion, from, 10, 3)
+    }
+
+    #[test]
+    fn left_and_right_wrap_across_lines_and_stop_at_the_ends() {
+        assert_eq!(to(M::Right, 9), 10);
+        assert_eq!(to(M::Left, 10), 9);
+        assert_eq!(to(M::Left, 0), 0);
+        assert_eq!(to(M::Right, 29), 29);
+    }
+
+    #[test]
+    fn up_and_down_keep_a_line_apart_and_stop_at_the_ends() {
+        assert_eq!(to(M::Down, 4), 14);
+        assert_eq!(to(M::Down, 25), 29);
+        assert_eq!(to(M::Up, 14), 4);
+        assert_eq!(to(M::Up, 3), 0);
+    }
+
+    #[test]
+    fn line_and_buffer_ends() {
+        assert_eq!(to(M::LineStart, 14), 10);
+        assert_eq!(to(M::LineEnd, 14), 19);
+        assert_eq!(to(M::BufferStart, 14), 0);
+        assert_eq!(to(M::BufferEnd, 14), 29);
+    }
+}
+
 fn grid_point(term: &Term<PtyResponder>, line: usize, column: usize) -> Point {
     Point::new(grid_line(term, line), Column(column))
 }
@@ -891,11 +1053,16 @@ fn buffer_point(term: &Term<PtyResponder>) -> Option<BufferPoint> {
     })
 }
 
-fn spawn_reader(mut reader: Box<dyn Read + Send>, state: Arc<Mutex<State>>, listener: Listener) {
+fn spawn_reader(
+    mut reader: Box<dyn Read + Send>,
+    state: Arc<Mutex<State>>,
+    listener: Listener,
+    nonce: Option<String>,
+) {
     thread::Builder::new()
         .name("term-session-pty-reader".into())
         .spawn(move || {
-            let mut scanner = Scanner::default();
+            let mut scanner = Scanner::with_nonce(nonce);
             let mut parser: Processor = Processor::new();
             let mut buf = vec![0u8; 64 * 1024];
             loop {

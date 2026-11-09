@@ -2,7 +2,7 @@
 //! step does to the text of `config.toml`. The panel draws the rows and saves
 //! the file; this module does the parts that can be tested without a window.
 
-use config::{Config, OptionAsMeta, edit};
+use config::{ClipboardWrite, Config, OptionAsMeta, edit};
 
 use crate::zoom::{MAX_SIZE, MIN_SIZE};
 
@@ -14,15 +14,17 @@ pub enum Setting {
     Opacity,
     Blur,
     OptionAsMeta,
+    ClipboardWrite,
 }
 
 /// The rows, top to bottom.
-pub const ROWS: [Setting; 5] = [
+pub const ROWS: [Setting; 6] = [
     Setting::FontSize,
     Setting::Theme,
     Setting::Opacity,
     Setting::Blur,
     Setting::OptionAsMeta,
+    Setting::ClipboardWrite,
 ];
 
 /// How much one step changes the opacity.
@@ -44,6 +46,7 @@ impl Setting {
             Setting::Opacity => "Background opacity",
             Setting::Blur => "Background blur",
             Setting::OptionAsMeta => "Option as Meta",
+            Setting::ClipboardWrite => "Programs can set clipboard",
         }
     }
 
@@ -59,6 +62,11 @@ impl Setting {
                 OptionAsMeta::Both => "Both",
                 OptionAsMeta::Left => "Left",
                 OptionAsMeta::Right => "Right",
+            }
+            .into(),
+            Setting::ClipboardWrite => match config.terminal.clipboard_write {
+                ClipboardWrite::Allow => "Allow",
+                ClipboardWrite::Deny => "Deny",
             }
             .into(),
         }
@@ -105,6 +113,13 @@ pub fn step(
             let next = (current as i32 + step).rem_euclid(META_ORDER.len() as i32) as usize;
             edit::set_option_as_meta(text, META_ORDER[next])
         }
+        Setting::ClipboardWrite => {
+            let next = match config.terminal.clipboard_write {
+                ClipboardWrite::Allow => ClipboardWrite::Deny,
+                ClipboardWrite::Deny => ClipboardWrite::Allow,
+            };
+            edit::set_clipboard_write(text, next)
+        }
     }
 }
 
@@ -132,6 +147,7 @@ mod tests {
         assert_eq!(Setting::Opacity.value_text(&config), "85%");
         assert_eq!(Setting::Blur.value_text(&config), "On");
         assert_eq!(Setting::OptionAsMeta.value_text(&config), "Off");
+        assert_eq!(Setting::ClipboardWrite.value_text(&config), "Allow");
     }
 
     #[test]
@@ -188,5 +204,15 @@ mod tests {
             current = parsed(&text);
         }
         assert_eq!(seen, META_ORDER);
+    }
+
+    #[test]
+    fn clipboard_write_toggles() {
+        let text = step("", Setting::ClipboardWrite, &Config::default(), &[], 1).unwrap();
+        assert!(text.contains("clipboard_write = \"deny\""), "{text}");
+        let denied = parsed(&text);
+        assert_eq!(Setting::ClipboardWrite.value_text(&denied), "Deny");
+        let back = step(&text, Setting::ClipboardWrite, &denied, &[], -1).unwrap();
+        assert_eq!(parsed(&back).terminal.clipboard_write, ClipboardWrite::Allow);
     }
 }

@@ -25,6 +25,10 @@ pub struct EditorDraw {
     pub text: String,
     pub spans: Vec<Span>,
     pub cursor: usize,
+    /// The selected chars, as indices into `text`. Drawn with the selection colour.
+    pub selection: Option<Range<usize>>,
+    /// The ghost text drawn after the editor text, not part of it.
+    pub suggestion: Option<String>,
 }
 
 /// Rows the completion menu shows at once. The rest scroll with the selection.
@@ -116,6 +120,8 @@ impl PromptState {
                     cursor: text.chars().count(),
                     text,
                     spans: Vec::new(),
+                    selection: None,
+                    suggestion: None,
                 }
             }
             None => {
@@ -123,11 +129,40 @@ impl PromptState {
                 EditorDraw {
                     cursor: self.buffer.cursor(),
                     spans: highlight(&text),
+                    selection: self.buffer.selection(),
+                    suggestion: self.suggestion(),
                     text,
                 }
             }
         }
     }
+
+    /// The rest of the suggested history entry, shown after the cursor. Only when
+    /// the cursor is at the end of a single-line buffer with no selection, and
+    /// neither the Ctrl+R search nor the completion menu is open.
+    pub fn suggestion(&self) -> Option<String> {
+        if self.search.is_some() || self.menu.is_some() || self.buffer.selection().is_some() {
+            return None;
+        }
+        let text = self.buffer.text();
+        if text.contains('\n') || self.buffer.cursor() != text.chars().count() {
+            return None;
+        }
+        self.history
+            .suggest(&text)
+            .map(|entry| entry[text.len()..].to_string())
+    }
+}
+
+/// The first word of a suggestion, with the spaces before it: what Option+Right accepts.
+pub fn first_word(suggestion: &str) -> &str {
+    let word_start = suggestion
+        .find(|c: char| !c.is_whitespace())
+        .unwrap_or(suggestion.len());
+    let word_end = suggestion[word_start..]
+        .find(char::is_whitespace)
+        .map_or(suggestion.len(), |offset| word_start + offset);
+    &suggestion[..word_end]
 }
 
 /// A stretch of editor chars that share one highlight kind. `start..end` are char
@@ -197,12 +232,24 @@ pub fn is_text_input(key_char: Option<&str>, control_or_platform: bool) -> bool 
 /// as a bracketed paste when the shell asked for one, so its newlines stay in
 /// the shell's line editor. Enter then runs the whole command.
 pub fn submit_bytes(text: &str, bracketed: bool) -> Vec<u8> {
-    let text = text.replace('\x1b', "");
+    // Text from history or elsewhere must not carry control characters.
+    let text = sanitize_paste(text);
     if text.contains('\n') && bracketed {
         format!("\x1b[200~{text}\x1b[201~\r").into_bytes()
     } else {
         format!("{}\r", text.replace('\n', "\r")).into_bytes()
     }
+}
+
+/// Text pasted into the input editor, made safe to keep in the buffer. Line
+/// endings become `\n`. Tabs and newlines stay, and every other control
+/// character (C0, DEL, C1) is removed, so nothing invisible reaches the shell.
+pub fn sanitize_paste(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .filter(|&c| c == '\n' || c == '\t' || !c.is_control())
+        .collect()
 }
 
 /// Reads the history of the user's shell: `$HISTFILE` if set, else the default
@@ -345,6 +392,35 @@ mod tests {
         assert_eq!(submit_bytes("x\x1b[31m", true), b"x[31m\r".to_vec());
     }
 
+    #[test]
+    fn control_characters_never_reach_the_shell_in_a_submit() {
+        assert_eq!(
+            submit_bytes("a\x03b\x0fc\x15\x7f\u{9b}d", false),
+            b"abcd\r".to_vec()
+        );
+        assert_eq!(
+            submit_bytes("a\x00\x1b\n\tb", true),
+            b"\x1b[200~a\n\tb\x1b[201~\r".to_vec()
+        );
+    }
+
+    #[test]
+    fn pasted_line_endings_become_newlines() {
+        assert_eq!(sanitize_paste("a\r\nb\rc\nd"), "a\nb\nc\nd");
+    }
+
+    #[test]
+    fn pasted_tabs_and_text_stay() {
+        assert_eq!(sanitize_paste("ls\t-la ünï"), "ls\t-la ünï");
+    }
+
+    #[test]
+    fn pasted_control_characters_are_removed() {
+        // ESC, ^C, ^O, ^U, NUL, vertical tab, form feed, DEL and C1 controls.
+        let text = "a\x1b[31m\x03\x0f\x15\x00\x0b\x0c\x7f\u{80}\u{9b}\u{9f}b";
+        assert_eq!(sanitize_paste(text), "a[31mb");
+    }
+
     /// The runs the element draws for `text`, as (text, kind) pairs.
     fn drawn(text: &str) -> Vec<(String, Option<Kind>)> {
         let chars: Vec<char> = text.chars().collect();
@@ -422,5 +498,44 @@ mod tests {
                 },
             ]
         );
+    }
+
+    fn state_with_history(entries: &[&str]) -> PromptState {
+        let mut state = PromptState::new();
+        state.history = History::new(entries.iter().map(|entry| entry.to_string()).collect());
+        state
+    }
+
+    #[test]
+    fn suggestion_is_the_rest_of_the_newest_match() {
+        let mut state = state_with_history(&["cargo test --workspace"]);
+        state.buffer.set_text("cargo t");
+        assert_eq!(state.suggestion().as_deref(), Some("est --workspace"));
+        assert_eq!(state.draw().suggestion.as_deref(), Some("est --workspace"));
+    }
+
+    #[test]
+    fn no_suggestion_when_the_cursor_is_not_at_the_end() {
+        let mut state = state_with_history(&["cargo test --workspace"]);
+        state.buffer.set_text("cargo t");
+        state.buffer.set_cursor(3);
+        assert_eq!(state.suggestion(), None);
+    }
+
+    #[test]
+    fn no_suggestion_while_the_search_is_open() {
+        let mut state = state_with_history(&["cargo test --workspace"]);
+        state.buffer.set_text("cargo t");
+        state.search = Some(HistorySearch::new(&state.history));
+        assert_eq!(state.suggestion(), None);
+        assert_eq!(state.draw().suggestion, None);
+    }
+
+    #[test]
+    fn first_word_takes_the_leading_spaces_and_one_word() {
+        assert_eq!(first_word(" --workspace now"), " --workspace");
+        assert_eq!(first_word("est --x"), "est");
+        assert_eq!(first_word("word"), "word");
+        assert_eq!(first_word(""), "");
     }
 }

@@ -85,6 +85,21 @@ impl History {
             .filter(|&i| self.entries[i].to_lowercase().contains(&query))
             .collect()
     }
+
+    /// The newest entry that starts with `prefix` and is longer than it, for the
+    /// inline suggestion. Multi-line entries are skipped. A blank prefix suggests nothing.
+    pub fn suggest(&self, prefix: &str) -> Option<&str> {
+        if prefix.trim().is_empty() {
+            return None;
+        }
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| {
+                !entry.contains('\n') && entry.len() > prefix.len() && entry.starts_with(prefix)
+            })
+            .map(String::as_str)
+    }
 }
 
 /// A `#` followed by digits is bash's timestamp line, not a command.
@@ -327,6 +342,45 @@ mod tests {
         assert_eq!(search.current(&history), Some("make b"));
         search.newer();
         assert_eq!(search.current(&history), Some("make b"));
+    }
+
+    #[test]
+    fn suggestion_is_the_newest_entry_that_starts_with_the_prefix() {
+        let history = History::new(vec![
+            "cargo test --all".to_string(),
+            "cargo test --workspace".to_string(),
+        ]);
+        assert_eq!(history.suggest("cargo t"), Some("cargo test --workspace"));
+    }
+
+    #[test]
+    fn exact_match_is_not_suggested() {
+        let history = History::new(vec!["ls -la".to_string()]);
+        assert_eq!(history.suggest("ls -la"), None);
+        assert_eq!(history.suggest("ls"), Some("ls -la"));
+    }
+
+    #[test]
+    fn blank_prefix_suggests_nothing() {
+        let history = History::new(vec!["ls".to_string()]);
+        assert_eq!(history.suggest(""), None);
+        assert_eq!(history.suggest("   "), None);
+    }
+
+    #[test]
+    fn multi_line_entries_are_skipped_for_suggestions() {
+        let history = History::new(vec![
+            "echo one".to_string(),
+            "echo one\necho two".to_string(),
+        ]);
+        assert_eq!(history.suggest("echo o"), Some("echo one"));
+    }
+
+    #[test]
+    fn suggestion_is_none_when_nothing_starts_with_the_prefix() {
+        let history = sample();
+        assert_eq!(history.suggest("make"), None);
+        assert_eq!(history.suggest("LS"), None);
     }
 
     #[test]
