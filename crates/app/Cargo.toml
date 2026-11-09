@@ -20,5 +20,5 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "c4273271
 async-channel = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "0.9"
 pulldown-cmark = { version = "0.13", default-features = false }
