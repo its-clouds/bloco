@@ -16,7 +16,7 @@ use std::time::Duration;
 use config::{Config, Files, Settings};
 use gpui::{
     Action, AnyElement, App, Bounds, Context, ElementId, Entity, EntityId, FocusHandle, Focusable, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PathPromptOptions, Pixels, Render, Subscription, Window, WindowBackgroundAppearance, canvas, div, prelude::*, px, relative,
+    MouseUpEvent, PathBuilder, PathPromptOptions, Pixels, Hsla, point, Render, Subscription, Window, WindowBackgroundAppearance, canvas, div, prelude::*, px, relative,
 };
 use term_session::{Color, NamedColor, Session, SessionEvent};
 
@@ -1561,7 +1561,7 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// The arrow before a group's name: ▾ while expanded, ▸ while collapsed.
+    /// The arrow before a group's name: down while expanded, right while collapsed.
     /// Clicking it hides or shows the group's sessions.
     fn group_chevron(&self, id: GroupId, cx: &mut Context<Self>) -> AnyElement {
         let chrome = &self.style.palette.chrome;
@@ -1577,7 +1577,7 @@ impl Workspace {
             .cursor_pointer()
             .text_color(chrome.muted)
             .hover(|d| d.bg(chrome.close_hover).text_color(chrome.text))
-            .child(if collapsed { "▸" } else { "▾" })
+            .child(disclosure(!collapsed, chrome.muted))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |ws, _: &MouseDownEvent, _, cx| {
@@ -2325,11 +2325,7 @@ impl Workspace {
                 .map(|(index, row)| {
                     let path = row.path.clone();
                     let is_dir = row.is_dir;
-                    let marker = match (is_dir, row.expanded) {
-                        (false, _) => "",
-                        (true, true) => "▾",
-                        (true, false) => "▸",
-                    };
+                    let expanded = row.expanded;
                     div()
                         .id(("file", index))
                         .flex()
@@ -2345,12 +2341,12 @@ impl Workspace {
                         .hover(|line| line.bg(chrome.tab_hover))
                         .child(
                             div()
+                                .flex()
+                                .items_center()
                                 .w(px(12.))
                                 .flex_shrink_0()
-                                .text_size(px(9.))
-                                .text_color(muted)
                                 .opacity(0.7)
-                                .child(marker),
+                                .when(is_dir, |slot| slot.child(disclosure(expanded, muted))),
                         )
                         .child(
                             div()
@@ -2910,6 +2906,31 @@ fn key_chips(shortcut: &str, chrome: &Chrome) -> impl IntoElement {
 /// The caret of the palette query: a 1px accent bar.
 fn caret(chrome: &Chrome) -> impl IntoElement {
     div().w(px(1.)).h(px(16.)).bg(chrome.accent)
+}
+
+/// A small filled triangle: pointing down while `expanded`, right otherwise.
+/// Painted as a path, not a glyph, because the UI font (`.SystemUIFont`) may
+/// have no ▾/▸ and then GPUI draws nothing.
+fn disclosure(expanded: bool, color: Hsla) -> impl IntoElement {
+    canvas(
+        |_, _, _| {},
+        move |bounds: Bounds<Pixels>, _, window, _| {
+            let (x, y) = (bounds.origin.x, bounds.origin.y);
+            let (w, h) = (bounds.size.width, bounds.size.height);
+            let points = if expanded {
+                [point(x, y + h * 0.2), point(x + w, y + h * 0.2), point(x + w * 0.5, y + h * 0.8)]
+            } else {
+                [point(x + w * 0.2, y), point(x + w * 0.8, y + h * 0.5), point(x + w * 0.2, y + h)]
+            };
+            let mut path = PathBuilder::fill();
+            path.add_polygon(&points, true);
+            if let Ok(path) = path.build() {
+                window.paint_path(path, color);
+            }
+        },
+    )
+    .flex_shrink_0()
+    .size(px(7.))
 }
 
 /// The saved form of a split tree. The directory is read from each pane's shell.
