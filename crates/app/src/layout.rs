@@ -43,6 +43,9 @@ pub struct SavedTab {
 pub struct SavedGroup {
     pub id: GroupId,
     pub name: String,
+    /// Hidden in the sidebar. Layouts saved before this field load expanded.
+    #[serde(default)]
+    pub collapsed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -123,6 +126,7 @@ mod tests {
             groups: vec![SavedGroup {
                 id: 1,
                 name: "Servers".into(),
+                collapsed: true,
             }],
         }
     }
@@ -161,6 +165,17 @@ mod tests {
             layout.tabs[0].root,
             SavedNode::Pane { cwd: None, name: None }
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_group_saved_before_collapsing_loads_expanded() {
+        let dir = std::env::temp_dir().join(format!("bloco-old-collapse-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let old = r#"{"tabs":[{"root":{"kind":"pane","cwd":null},"active":0,"group":1}],"active_tab":0,"groups":[{"id":1,"name":"Servers"}]}"#;
+        fs::write(dir.join(FILE), old).unwrap();
+        let layout = load(&dir).expect("a group without the collapsed field loads");
+        assert!(!layout.groups[0].collapsed);
         let _ = fs::remove_dir_all(&dir);
     }
 

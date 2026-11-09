@@ -11,6 +11,8 @@ pub type GroupId = u64;
 pub struct Group {
     pub id: GroupId,
     pub name: String,
+    /// Hidden in the sidebar: only its header shows (and the active tab, if it is in it).
+    pub collapsed: bool,
 }
 
 /// What the list operations need from a tab: which group it is in.
@@ -125,7 +127,17 @@ pub fn display_order<T: Grouped>(items: &[T], groups: &[Group]) -> Vec<usize> {
     order
 }
 
-/// The index of the tab `step` places from `active` in `display_order`,
+/// `display_order` without the tabs of collapsed groups, which the sidebar
+/// hides. The `active` tab always stays, so the selection is never hidden.
+pub fn visible_order<T: Grouped>(items: &[T], groups: &[Group], active: usize) -> Vec<usize> {
+    let collapsed = |id: GroupId| groups.iter().any(|group| group.id == id && group.collapsed);
+    display_order(items, groups)
+        .into_iter()
+        .filter(|&i| i == active || !items[i].group().is_some_and(collapsed))
+        .collect()
+}
+
+/// The index of the tab `step` places from `active` in `visible_order`,
 /// wrapping around. `None` when there are no tabs.
 pub fn step_in_display_order<T: Grouped>(
     items: &[T],
@@ -133,7 +145,7 @@ pub fn step_in_display_order<T: Grouped>(
     active: usize,
     step: isize,
 ) -> Option<usize> {
-    let order = display_order(items, groups);
+    let order = visible_order(items, groups, active);
     if order.is_empty() {
         return None;
     }
@@ -180,6 +192,10 @@ mod tests {
 
     fn item(name: &'static str, group: Option<GroupId>) -> Item {
         Item { name, group }
+    }
+
+    fn group(id: GroupId, name: &str, collapsed: bool) -> Group {
+        Group { id, name: name.into(), collapsed }
     }
 
     fn names(items: &[Item]) -> Vec<&'static str> {
@@ -409,14 +425,14 @@ mod tests {
 
     #[test]
     fn display_order_puts_ungrouped_tabs_first_then_groups_in_order() {
-        let groups = [Group { id: 2, name: "b".into() }, Group { id: 1, name: "a".into() }];
+        let groups = [group(2, "b", false), group(1, "a", false)];
         let items = [item("a1", Some(1)), item("b1", Some(2)), item("x", None), item("a2", Some(1))];
         assert_eq!(display_order(&items, &groups), vec![2, 1, 0, 3]);
     }
 
     #[test]
     fn stepping_follows_the_sidebar_order_and_wraps() {
-        let groups = [Group { id: 1, name: "a".into() }];
+        let groups = [group(1, "a", false)];
         // Tab list: a1, a2, x. Sidebar: x, a1, a2.
         let items = [item("a1", Some(1)), item("a2", Some(1)), item("x", None)];
         assert_eq!(step_in_display_order(&items, &groups, 2, 1), Some(0));
@@ -426,6 +442,25 @@ mod tests {
         assert_eq!(step_in_display_order(&items, &groups, 0, -1), Some(2));
         let empty: [Item; 0] = [];
         assert_eq!(step_in_display_order(&empty, &groups, 0, 1), None);
+    }
+
+    #[test]
+    fn a_collapsed_group_hides_its_tabs_but_not_the_active_one() {
+        let groups = [group(1, "a", true)];
+        // Tab list: a1, a2, x. Sidebar: x, then the collapsed group.
+        let items = [item("a1", Some(1)), item("a2", Some(1)), item("x", None)];
+        assert_eq!(visible_order(&items, &groups, 2), vec![2]);
+        assert_eq!(visible_order(&items, &groups, 1), vec![2, 1]);
+    }
+
+    #[test]
+    fn stepping_skips_the_tabs_of_a_collapsed_group() {
+        let groups = [group(1, "a", true), group(2, "b", false)];
+        let items = [item("x", None), item("a1", Some(1)), item("a2", Some(1)), item("b1", Some(2))];
+        assert_eq!(step_in_display_order(&items, &groups, 0, 1), Some(3));
+        assert_eq!(step_in_display_order(&items, &groups, 3, 1), Some(0));
+        // From inside the collapsed group, the next step leaves it.
+        assert_eq!(step_in_display_order(&items, &groups, 1, 1), Some(3));
     }
 
     #[test]

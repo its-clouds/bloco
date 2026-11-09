@@ -26,7 +26,7 @@ use crate::file_viewer::{FileViewer, FileViewerEvent};
 use crate::commands::{
     self, ClosePane, ClosePreview, CloseTab, FocusDown, FocusLeft, FocusRight, FocusUp, ImportTheme, MoveTabLeft,
     MoveTabRight, MoveTabToGroup, NewGroup, NewTab, NextTab, OpenSettings, PreviousTab, RenameGroup,
-    RenameTab, RenamePane, DeleteGroup, SelectTab, ShowFiles, ShowSessions, SplitDown, SplitRight, TogglePalette,
+    RenameTab, RenamePane, DeleteGroup, ToggleGroup, SelectTab, ShowFiles, ShowSessions, SplitDown, SplitRight, TogglePalette,
     ToggleSidebar, ZoomIn, ZoomOut, ZoomReset, MovePaneToNewTab, MovePaneToTab,
 };
 use crate::layout::{self, SavedGroup, SavedLayout, SavedNode, SavedTab};
@@ -501,6 +501,7 @@ impl Workspace {
         self.groups.push(Group {
             id,
             name: format!("Group {id}"),
+            collapsed: false,
         });
         id
     }
@@ -575,6 +576,24 @@ impl Workspace {
             self.reveal_sessions();
             self.renaming = Some(Renaming::Group { id, text: name });
             window.focus(&self.rename_focus, cx);
+            cx.notify();
+        }
+    }
+
+    /// Hides or shows the sessions of the active tab's group in the sidebar.
+    fn toggle_group_action(&mut self, _: &ToggleGroup, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.active_group() {
+            self.reveal_sessions();
+            self.toggle_group(id, cx);
+        }
+    }
+
+    /// Hides or shows group `id`'s sessions in the sidebar. Its header stays,
+    /// and so does the active session. Next/previous session and Cmd+1…9 skip
+    /// the hidden ones.
+    fn toggle_group(&mut self, id: GroupId, cx: &mut Context<Self>) {
+        if let Some(group) = self.groups.iter_mut().find(|group| group.id == id) {
+            group.collapsed = !group.collapsed;
             cx.notify();
         }
     }
@@ -1148,6 +1167,7 @@ impl Workspace {
                 .map(|group| SavedGroup {
                     id: group.id,
                     name: group.name.clone(),
+                    collapsed: group.collapsed,
                 })
                 .collect(),
         }
@@ -1168,6 +1188,7 @@ impl Workspace {
             .map(|group| Group {
                 id: group.id,
                 name: group.name.clone(),
+                collapsed: group.collapsed,
             })
             .collect();
         let mut tabs = Vec::new();
@@ -1538,6 +1559,46 @@ impl Workspace {
                 }),
             )
             .into_any_element()
+    }
+
+    /// The arrow before a group's name: ▾ while expanded, ▸ while collapsed.
+    /// Clicking it hides or shows the group's sessions.
+    fn group_chevron(&self, id: GroupId, cx: &mut Context<Self>) -> AnyElement {
+        let chrome = &self.style.palette.chrome;
+        let collapsed = self.groups.iter().any(|group| group.id == id && group.collapsed);
+        div()
+            .id(("group-toggle", id))
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .justify_center()
+            .size(px(14.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .text_color(chrome.muted)
+            .hover(|d| d.bg(chrome.close_hover).text_color(chrome.text))
+            .child(if collapsed { "▸" } else { "▾" })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |ws, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    ws.toggle_group(id, cx);
+                }),
+            )
+            .into_any_element()
+    }
+
+    /// How many sessions a collapsed group hides, for its header. `None` while
+    /// it is expanded or hides nothing.
+    fn hidden_count(&self, id: GroupId) -> Option<usize> {
+        let collapsed = self.groups.iter().any(|group| group.id == id && group.collapsed);
+        let hidden = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(index, tab)| tab.group == Some(id) && *index != self.active_tab)
+            .count();
+        (collapsed && hidden > 0).then_some(hidden)
     }
 
     /// The × that deletes a group. Its tabs stay open, in no group.
@@ -1929,9 +1990,10 @@ impl Workspace {
         }
     }
 
-    /// Cmd+N picks the Nth session as the sidebar shows it, not the Nth in `self.tabs`.
+    /// Cmd+N picks the Nth session as the sidebar shows it (hidden ones not
+    /// counted), not the Nth in `self.tabs`.
     fn select_tab_action(&mut self, action: &SelectTab, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(&index) = tab_groups::display_order(&self.tabs, &self.groups).get(action.0) {
+        if let Some(&index) = tab_groups::visible_order(&self.tabs, &self.groups, self.active_tab).get(action.0) {
             self.select_tab(index, window, cx);
         }
     }
@@ -2044,11 +2106,16 @@ impl Workspace {
 
         let body: Vec<AnyElement> = match mode {
             Mode::Sessions => {
+                // The rows the sidebar shows: sessions of collapsed groups are left out.
+                let visible = tab_groups::visible_order(&self.tabs, &self.groups, self.active_tab);
                 let rows: Vec<(Option<GroupId>, AnyElement)> = self
                     .tabs
                     .iter()
                     .enumerate()
+                    .filter(|(index, _)| visible.contains(index))
                     .map(|(index, tab)| {
+                        // The Cmd+N this row answers to, counted in sidebar order.
+                        let position = visible.iter().position(|&i| i == index).unwrap_or(usize::MAX);
                         let active = index == self.active_tab;
                         let pane = tab.active.read(cx);
                         let title = tab.title(cx);
@@ -2189,14 +2256,14 @@ impl Workspace {
                                     .justify_center()
                                     .flex_shrink_0()
                                     .size(px(16.))
-                                    .when(index < 9, |slot| {
+                                    .when(position < 9, |slot| {
                                         slot.child(
                                             div()
                                                 .text_size(px(10.5))
                                                 .text_color(muted)
                                                 .opacity(0.7)
                                                 .group_hover(group.clone(), |hint| hint.invisible())
-                                                .child(format!("⌘{}", index + 1)),
+                                                .child(format!("⌘{}", position + 1)),
                                         )
                                     })
                                     .child(
@@ -2493,7 +2560,11 @@ impl Workspace {
             .text_color(self.style.palette.chrome.muted)
             // The header a drag would land on is tinted: a drop joins the group.
             .when(target, |header| header.bg(accent.opacity(0.15)))
+            .child(self.group_chevron(id, cx))
             .child(self.group_label(id, cx))
+            .when_some(self.hidden_count(id), |header, count| {
+                header.child(div().flex_shrink_0().child(count.to_string()))
+            })
             .child(self.group_delete_button(id, cx))
             .on_mouse_move(cx.listener(move |ws, event: &MouseMoveEvent, _, cx| {
                 ws.hover_drop(SessionDrop::Group(id), event, cx);
@@ -2719,6 +2790,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::new_group_action))
             .on_action(cx.listener(Self::rename_group_action))
             .on_action(cx.listener(Self::delete_group_action))
+            .on_action(cx.listener(Self::toggle_group_action))
             .on_action(cx.listener(Self::open_group_picker))
             .on_action(cx.listener(Self::move_pane_to_new_tab))
             .on_action(cx.listener(Self::open_tab_picker))
