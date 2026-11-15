@@ -8,4 +8,4 @@ description = "The prompt input editor of Bloco: text buffer, undo, history, hig
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "0.9"
