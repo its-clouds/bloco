@@ -7,7 +7,7 @@ publish.workspace = true
 description = "PTY session, VT state and command blocks for Bloco. No UI code."
 
 [dependencies]
-alacritty_terminal = "0.25"
+alacritty_terminal = "0.26"
 anyhow = "1"
 portable-pty = "0.9"
 regex = "1"
