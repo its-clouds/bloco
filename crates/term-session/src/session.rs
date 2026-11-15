@@ -452,23 +452,7 @@ impl Session {
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         self.master.resize(pty_size(cols, rows))?;
         let mut guard = self.state.lock().expect("state lock poisoned");
-        let State {
-            term,
-            blocks,
-            scrollback,
-        } = &mut *guard;
-        scrollback.stop(term);
-        if term.mode().contains(TermMode::ALT_SCREEN) {
-            // A height change keeps the lines of the primary buffer in place.
-            if cols as usize != term.columns() {
-                blocks.forget_positions();
-            }
-            term.resize(TermSize::new(cols as usize, rows as usize));
-            return Ok(());
-        }
-        let anchors = blocks.anchors(&Layout::of(term));
-        term.resize(TermSize::new(cols as usize, rows as usize));
-        blocks.restore(&anchors, &Layout::of(term));
+        guard.resize(cols, rows);
         Ok(())
     }
 
@@ -742,9 +726,39 @@ impl Session {
     /// wrapped rows joined. `None` for an unknown block or one without output
     /// lines (still running, or on the alternate screen).
     pub fn block_output(&self, id: u64) -> Option<String> {
-        let state = self.state.lock().expect("state lock poisoned");
-        let block = state.blocks.all().iter().find(|b| b.id == id)?;
-        let term = &state.term;
+        self.state
+            .lock()
+            .expect("state lock poisoned")
+            .block_output(id)
+    }
+}
+
+impl State {
+    /// See [`Session::resize`]. The grid part, without the PTY.
+    fn resize(&mut self, cols: u16, rows: u16) {
+        let State {
+            term,
+            blocks,
+            scrollback,
+        } = self;
+        scrollback.stop(term);
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            // A height change keeps the lines of the primary buffer in place.
+            if cols as usize != term.columns() {
+                blocks.forget_positions();
+            }
+            term.resize(TermSize::new(cols as usize, rows as usize));
+            return;
+        }
+        let anchors = blocks.anchors(&Layout::of(term));
+        term.resize(TermSize::new(cols as usize, rows as usize));
+        blocks.restore(&anchors, &Layout::of(term));
+    }
+
+    /// See [`Session::block_output`].
+    fn block_output(&self, id: u64) -> Option<String> {
+        let block = self.blocks.all().iter().find(|b| b.id == id)?;
+        let term = &self.term;
         let start = block.output_line?;
         let end = block
             .end_line?
@@ -1109,7 +1123,7 @@ fn process(state: &mut State, parser: &mut Processor, scanner: &mut Scanner, byt
             parser.advance(term, &bytes[parsed..end]);
             parsed = end;
             scrollback.count(term, blocks);
-            blocks.apply(mark, buffer_point(term));
+            apply_mark(term, blocks, mark);
         }
         if byte == ESC {
             parser.advance(term, &bytes[parsed..index]);
@@ -1121,11 +1135,43 @@ fn process(state: &mut State, parser: &mut Processor, scanner: &mut Scanner, byt
         parser.advance(term, &bytes[parsed..end]);
         parsed = end;
         scrollback.count(term, blocks);
-        blocks.apply(mark, buffer_point(term));
+        apply_mark(term, blocks, mark);
     }
     parser.advance(term, &bytes[parsed..]);
     scrollback.count(term, blocks);
     scrollback.stop(term);
+}
+
+/// Applies `mark` to the block list at the cursor.
+///
+/// A command's output starts a line of its own: the shell ends the command line
+/// with a newline before `C`. Readline can leave the row above flagged as
+/// wrapped, though. When the prompt and command fill the width exactly, it forces
+/// the wrap by writing a space, then moves back up and prints `\r\n`, and nothing
+/// clears the flag. A rewrap would then join the output to the command line, and
+/// the block's output would start on its prompt. So at `C`, with the cursor in
+/// the first column, the row above ends its logical line.
+fn apply_mark(term: &mut Term<PtyResponder>, blocks: &mut Blocks, mark: Mark) {
+    if matches!(mark, Mark::CommandStart { .. }) {
+        end_wrap_above_cursor(term);
+    }
+    blocks.apply(mark, buffer_point(term));
+}
+
+/// Clears the wrap flag of the row above the cursor when the cursor is in the
+/// first column of the primary screen.
+fn end_wrap_above_cursor(term: &mut Term<PtyResponder>) {
+    if term.mode().contains(TermMode::ALT_SCREEN) {
+        return;
+    }
+    let cursor = term.grid().cursor.point;
+    if cursor.column.0 != 0 || cursor.line <= term.topmost_line() {
+        return;
+    }
+    let last = term.last_column();
+    term.grid_mut()[cursor.line - 1i32][last]
+        .flags
+        .remove(Flags::WRAPLINE);
 }
 
 fn pty_size(cols: u16, rows: u16) -> PtySize {
@@ -1238,6 +1284,31 @@ mod tests {
         let mut state = state_for(b"\x1b]133;A\x07$ \x1b]133;B\x07");
         assert!(frame_of(&mut state, None, true).rows.is_empty());
         assert_eq!(frame_of(&mut state, None, false).rows.len(), 6);
+    }
+
+    /// Readline's bytes for a prompt and command that fill the 80 columns
+    /// exactly: the line, a space that forces the wrap, then back up and `\r\n`.
+    /// The space leaves the prompt row flagged as wrapped. The output still
+    /// starts a line of its own, and stays apart from the prompt when the width
+    /// changes.
+    #[test]
+    fn output_after_a_command_line_of_exactly_the_width_is_its_own_line() {
+        let prompt = format!("{}$ ", "x".repeat(70));
+        let bytes = format!(
+            "\x1b]133;A\x07{prompt}\x1b]133;B\x07echo one \r\x1b[A\r\n\
+             \x1b]133;C;echo one\x07one\r\n\x1b]133;D;0\x07\x1b]133;A\x07{prompt}\x1b]133;B\x07"
+        );
+        let mut state = state_for(bytes.as_bytes());
+        let id = state.blocks.all()[0].id;
+        assert_eq!(state.block_output(id).as_deref(), Some("one"));
+        for (cols, rows) in [(82, 6), (120, 6), (40, 6), (80, 6)] {
+            state.resize(cols, rows);
+            assert_eq!(
+                state.block_output(id).as_deref(),
+                Some("one"),
+                "at {cols}x{rows}"
+            );
+        }
     }
 
     #[test]

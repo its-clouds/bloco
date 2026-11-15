@@ -58,6 +58,13 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install shells for integration tests
         run: sudo apt-get update && sudo apt-get install -y zsh fish
+      # Ubuntu's /etc/zsh/zshrc runs compinit. The runner has group or world
+      # writable directories in zsh's fpath, so compinit stops at startup to
+      # ask whether to use them, and the tests' first keystroke answers it.
+      # Taking away those write bits is the fix compaudit asks for. compaudit
+      # exits 1 when it lists directories, which is the case to fix here.
+      - name: Secure zsh completion directories
+        run: zsh -fc 'autoload -U compaudit; compaudit || true' | xargs -r sudo chmod g-w,o-w
       - name: Test
         run: cargo test --locked -p term-session -p input-editor -p config
 

@@ -264,7 +264,11 @@ mod tests {
         let session = Session::spawn_shell(&shell, 100, 24, None, |_| {}).unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
         while session.input_mode() != crate::InputMode::Prompt {
-            assert!(Instant::now() < deadline, "zsh never reached its prompt");
+            assert!(
+                Instant::now() < deadline,
+                "zsh never reached its prompt. Screen: {:?}",
+                session.snapshot().text_lines()
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
         session.write(b"echo hi\r").unwrap();
@@ -448,7 +452,8 @@ mod tests {
         {
             assert!(
                 Instant::now() < deadline,
-                "fewer than {count} finished blocks"
+                "fewer than {count} finished blocks. Screen: {:?}",
+                session.snapshot().text_lines()
             );
             std::thread::sleep(Duration::from_millis(50));
         }
